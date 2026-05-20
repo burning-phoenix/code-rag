@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "code-rag"
+version = "0.2.0"
+description = "MCP server for code and document RAG with AST-aware chunking and Qdrant"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]",
+    "qdrant-client",
+    "httpx",
+    "python-dotenv",
+    "tree-sitter>=0.24.0",
+    "tree-sitter-language-pack>=0.24.0",
+]
+
+[project.scripts]
+code-rag = "code_rag.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/code_rag"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
