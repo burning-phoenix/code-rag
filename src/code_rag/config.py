@@ -60,10 +60,7 @@ def load_config(project_dir: Path | str | None = None) -> ProjectConfig:
     if _cached_config is not None and project_dir is None:
         return _cached_config
 
-    if project_dir is not None:
-        project_dir = Path(project_dir).resolve()
-    else:
-        project_dir = _resolve_project_dir()
+    project_dir = Path(project_dir).resolve() if project_dir is not None else _resolve_project_dir()
 
     # Load .env from project directory if it exists
     env_path = project_dir / ".env"

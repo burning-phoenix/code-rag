@@ -1,0 +1,11 @@
+The first paragraph introduces the plaintext fixture. It is separated from the
+next block by a single blank line, which is the only boundary the plaintext
+chunker understands.
+
+The second paragraph is short.
+
+The third paragraph is a little longer so that, taken together with the others,
+the merge pass has something to combine when a reasonable minimum chunk size is
+configured for the test.
+
+The fourth and final paragraph closes the file with one last block of prose.

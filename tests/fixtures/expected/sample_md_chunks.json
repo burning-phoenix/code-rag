@@ -1,0 +1,19 @@
+[
+  {
+    "text": "# Overview\n\nThis document is a small fixture used by the markdown chunker tests. It has a\nhandful of sections of varying sizes so the merge and split passes both run.\n\n## Background\n\nShort section.\n\n## Mathematics\n\nThe loss is defined below as a display block:\n\n$$\nL(\\theta) = \\frac{1}{n} \\sum_{i=1}^{n} (y_i - \\hat{y}_i)^2\n$$\n\nWe minimise $L(\\theta)$ with gradient descent, where $\\nabla L$ points uphill\nand we step in the $-\\nabla L$ direction with learning rate $\\eta$.\n\n## Details\n\nParagraph one of the details section provides enough prose to make this the\nlargest section in the document, which lets the split pass exercise its\nparagraph-boundary logic when a small max chunk size is configured.\n\nParagraph two continues the discussion with more sentences so that there is a\nclear blank-line boundary for the splitter to choose. It keeps going for a few\nlines to push the section comfortably over a low max threshold.\n\nParagraph three wraps things up with a final blank-line-delimited block.",
+    "file_name": "sample.md",
+    "section_title": "Overview",
+    "start_line": 1,
+    "end_line": 31,
+    "math_density": 0.16129032258064516,
+    "source_path": null,
+    "chunk_id": null,
+    "chunk_type": "markdown",
+    "language": null,
+    "symbol_name": null,
+    "symbol_type": null,
+    "parent_id": null,
+    "summary": null,
+    "hypothetical_questions": null
+  }
+]

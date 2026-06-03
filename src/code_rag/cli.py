@@ -2,11 +2,19 @@
 CLI entry point: code-rag init | ingest | serve
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .config import ProjectConfig
+    from .eval.dataset import GoldenDataset
+    from .eval.runner import RunConfig
 
 
 def _slugify(name: str) -> str:
@@ -19,7 +27,7 @@ def _collection_name(name: str) -> str:
     return name.lower().replace(" ", "_").replace("-", "_")
 
 
-def cmd_init(args):
+def cmd_init(args: argparse.Namespace) -> None:
     """Initialize a new code-rag project in the target directory."""
     project_dir = Path(args.project_dir).resolve()
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -38,9 +46,9 @@ def cmd_init(args):
         "pointer_index": "pointer_index.json",
         "qdrant_url": qdrant_url,
         "description": f"A local RAG server for {dir_name}. "
-                        f"Use 'search_documents' for semantic search, "
-                        f"'search_code' for code-aware search with class context, or "
-                        f"'lookup_index' for exact concept-to-location lookups.",
+        f"Use 'search_documents' for semantic search, "
+        f"'search_code' for code-aware search with class context, or "
+        f"'lookup_index' for exact concept-to-location lookups.",
         "key_terms": [],
         "file_extensions": [".md"],
         "enrich_chunks": False,
@@ -48,26 +56,15 @@ def cmd_init(args):
 
     config_path = project_dir / "rag-config.json"
     if config_path.exists():
-        print(f"  [skip] rag-config.json already exists", file=sys.stderr)
+        print("  [skip] rag-config.json already exists", file=sys.stderr)
     else:
         config_path.write_text(json.dumps(config, indent=2))
-        print(f"  [created] rag-config.json", file=sys.stderr)
+        print("  [created] rag-config.json", file=sys.stderr)
 
     # 2. Create docker-compose.yml
-    compose = {
-        "services": {
-            "qdrant": {
-                "image": "qdrant/qdrant:latest",
-                "container_name": container_name,
-                "volumes": ["./qdrant_storage:/qdrant/storage"],
-                "restart": "unless-stopped",
-            }
-        }
-    }
-
     compose_path = project_dir / "docker-compose.yml"
     if compose_path.exists():
-        print(f"  [skip] docker-compose.yml already exists", file=sys.stderr)
+        print("  [skip] docker-compose.yml already exists", file=sys.stderr)
     else:
         # Write YAML manually for clean formatting
         compose_content = (
@@ -80,7 +77,7 @@ def cmd_init(args):
             f"    restart: unless-stopped\n"
         )
         compose_path.write_text(compose_content)
-        print(f"  [created] docker-compose.yml", file=sys.stderr)
+        print("  [created] docker-compose.yml", file=sys.stderr)
 
     # 3. Create/merge .mcp.json
     python_exe = sys.executable
@@ -105,12 +102,12 @@ def cmd_init(args):
     else:
         mcp_data = {"mcpServers": {name: mcp_entry}}
         mcp_path.write_text(json.dumps(mcp_data, indent=4))
-        print(f"  [created] .mcp.json", file=sys.stderr)
+        print("  [created] .mcp.json", file=sys.stderr)
 
     # 4. Create RAG_data directory
     data_dir = project_dir / "RAG_data"
     data_dir.mkdir(exist_ok=True)
-    print(f"  [created] RAG_data/", file=sys.stderr)
+    print("  [created] RAG_data/", file=sys.stderr)
 
     # 5. Create/append .gitignore entries
     gitignore_entries = [
@@ -127,43 +124,41 @@ def cmd_init(args):
                 f.write("\n# code-rag\n")
                 for entry in new_entries:
                     f.write(f"{entry}\n")
-            print(f"  [updated] .gitignore", file=sys.stderr)
+            print("  [updated] .gitignore", file=sys.stderr)
         else:
-            print(f"  [skip] .gitignore already has entries", file=sys.stderr)
+            print("  [skip] .gitignore already has entries", file=sys.stderr)
     else:
         with open(gitignore_path, "w") as f:
             f.write("# code-rag\n")
             for entry in gitignore_entries:
                 f.write(f"{entry}\n")
-        print(f"  [created] .gitignore", file=sys.stderr)
+        print("  [created] .gitignore", file=sys.stderr)
 
     # 6. Create .env template
     env_path = project_dir / ".env"
     if not env_path.exists():
-        env_path.write_text(
-            "# code-rag environment variables\n"
-            "OPENROUTER_API_KEY=\n"
-        )
-        print(f"  [created] .env (add your OPENROUTER_API_KEY)", file=sys.stderr)
+        env_path.write_text("# code-rag environment variables\nOPENROUTER_API_KEY=\n")
+        print("  [created] .env (add your OPENROUTER_API_KEY)", file=sys.stderr)
 
     # Print summary
     print(f"\nProject initialized at {project_dir}", file=sys.stderr)
-    print(f"\nNext steps:", file=sys.stderr)
-    print(f"  1. Add your OPENROUTER_API_KEY to .env", file=sys.stderr)
-    print(f"  2. Drop files into RAG_data/ (code, markdown, or any supported format)", file=sys.stderr)
-    print(f"  3. Update file_extensions in rag-config.json (e.g. [\".py\", \".md\", \".glsl\"])", file=sys.stderr)
-    print(f"  4. Start Qdrant:  docker compose up -d", file=sys.stderr)
-    print(f"  5. Run ingestion: code-rag ingest", file=sys.stderr)
-    print(f"  6. (Optional) Add --enrich flag to generate LLM summaries per chunk", file=sys.stderr)
-    print(f"  7. (Optional) Add domain-specific terms to key_terms in rag-config.json", file=sys.stderr)
+    print("\nNext steps:", file=sys.stderr)
+    print("  1. Add your OPENROUTER_API_KEY to .env", file=sys.stderr)
+    print("  2. Drop files into RAG_data/ (code, markdown, or any supported type)", file=sys.stderr)
+    print('  3. Set file_extensions in rag-config.json (e.g. [".py", ".md"])', file=sys.stderr)
+    print("  4. Start Qdrant:  docker compose up -d", file=sys.stderr)
+    print("  5. Run ingestion: code-rag ingest", file=sys.stderr)
+    print("  6. (Optional) Add --enrich flag to generate LLM summaries per chunk", file=sys.stderr)
+    print("  7. (Optional) Add domain terms to key_terms in rag-config.json", file=sys.stderr)
     print(f"\nQdrant container: {container_name}", file=sys.stderr)
     print(f"Qdrant URL:       {qdrant_url}", file=sys.stderr)
     print(f"Collection:       {collection}", file=sys.stderr)
 
 
-def cmd_ingest(args):
+def cmd_ingest(args: argparse.Namespace) -> None:
     """Run the ingest pipeline."""
     from .ingest import run_ingest
+
     run_ingest(
         project_dir=args.project_dir,
         no_recreate=args.no_recreate,
@@ -175,15 +170,158 @@ def cmd_ingest(args):
     )
 
 
-def cmd_serve(args):
+def cmd_serve(args: argparse.Namespace) -> None:
     """Start the MCP server."""
     if args.project_dir:
         os.environ["RAG_PROJECT_DIR"] = str(Path(args.project_dir).resolve())
     from .server import main as server_main
+
     server_main()
 
 
-def main():
+def cmd_eval(args: argparse.Namespace) -> None:
+    """Run the retrieval evaluation against a golden dataset.
+
+    Diagnostic only — requires an API key (to embed queries) and a running
+    Qdrant. Indexes the dataset's corpus into an isolated collection, runs each
+    query, and prints a metric table swept over the requested top_k values.
+    """
+    import asyncio
+    import logging
+
+    from .chunkers import chunk_directory
+    from .config import load_config
+    from .eval.dataset import load_dataset
+    from .eval.metrics import QueryResult
+    from .eval.report import build_markdown_report, chunk_geometry
+    from .eval.runner import EvalRunner, RunConfig
+    from .providers import OpenRouterEmbeddings, OpenRouterLLM, QdrantVectorStore
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+    config = load_config(args.project_dir)
+
+    dataset_path = Path(args.dataset).resolve()
+    dataset = load_dataset(dataset_path)
+
+    if not dataset.queries:
+        print(
+            f"Golden dataset {dataset_path} has no queries yet — nothing to evaluate.",
+            file=sys.stderr,
+        )
+        print(
+            f"Author queries there and add a corpus under '{dataset.corpus_dir}'.", file=sys.stderr
+        )
+        return
+
+    # Point the pipeline at the eval corpus and an isolated collection.
+    corpus_dir = (dataset_path.parent / dataset.corpus_dir).resolve()
+    config.data_dir = corpus_dir
+    config.collection = f"{config.collection}_eval"
+    config.pointer_index = corpus_dir.parent / "eval_pointer_index.json"
+
+    if not config.openrouter_api_key:
+        print(
+            "ERROR: OPENROUTER_API_KEY is required for eval (it embeds queries).", file=sys.stderr
+        )
+        sys.exit(1)
+
+    top_k_values = [int(x) for x in args.top_k.split(",")]
+
+    embedder = OpenRouterEmbeddings(api_key=config.openrouter_api_key)
+    store = QdrantVectorStore(config.qdrant_url)
+    llm = OpenRouterLLM(api_key=config.openrouter_api_key)
+
+    # --matrix runs the standard ablation set; otherwise a single config from flags.
+    if args.matrix:
+        runs = [
+            RunConfig(label="ast+enrich", enrich=True, chunker="ast"),
+            RunConfig(label="ast", enrich=False, chunker="ast"),
+            RunConfig(label="line-based", enrich=False, chunker="line-based"),
+        ]
+    else:
+        label = args.chunker + ("" if args.no_enrich else "+enrich")
+        runs = [RunConfig(label=label, enrich=not args.no_enrich, chunker=args.chunker)]
+
+    runner = EvalRunner(config, embedder, store, llm=llm, enrich_batch_size=args.enrich_batch_size)
+
+    results_by_label: dict[str, list[QueryResult]] = {}
+    geometry_by_label: dict[str, dict[str, float]] = {}
+    geometry_by_chunker: dict[str, dict[str, float]] = {}
+    for run in runs:
+        results_by_label[run.label] = asyncio.run(runner.evaluate(dataset, run, max(top_k_values)))
+        # Geometry depends only on the chunker (enrichment doesn't move boundaries),
+        # so compute once per distinct chunker and reuse. No API — pure chunking.
+        if run.chunker not in geometry_by_chunker:
+            chunks = chunk_directory(config.data_dir, config, run.registry())
+            geometry_by_chunker[run.chunker] = chunk_geometry(chunks)
+        geometry_by_label[run.label] = geometry_by_chunker[run.chunker]
+
+    setup_md = _eval_setup_md(config, dataset, corpus_dir, runs, top_k_values)
+    report = build_markdown_report(results_by_label, geometry_by_label, top_k_values, setup_md)
+    print(report)
+    if args.report_md:
+        Path(args.report_md).write_text(report, encoding="utf-8")
+        print(f"\n[report written to {args.report_md}]", file=sys.stderr)
+
+
+def _eval_setup_md(
+    config: ProjectConfig,
+    dataset: GoldenDataset,
+    corpus_dir: Path,
+    runs: list[RunConfig],
+    top_k_values: list[int],
+) -> str:
+    """Build the run-specific 'Setup' prose for the evaluation report."""
+    import os
+    from collections import Counter
+
+    from .providers.openrouter import EMBEDDING_MODEL
+
+    # Corpus: files + total lines per content type.
+    corpus_lines: Counter = Counter()
+    corpus_files: Counter = Counter()
+    exts = set(config.file_extensions)
+    for p in sorted(corpus_dir.rglob("*")):
+        if p.is_file() and p.suffix in exts:
+            corpus_files[p.suffix] += 1
+            text = p.read_text(encoding="utf-8", errors="replace")
+            corpus_lines[p.suffix] += len(text.splitlines())
+    corpus_rows = "\n".join(
+        f"| `{ext}` | {corpus_files[ext]} | {corpus_lines[ext]} |" for ext in sorted(corpus_files)
+    )
+
+    # Dataset distribution.
+    by_tool = Counter(q.tool for q in dataset.queries)
+    span_ext = Counter(
+        os.path.splitext(s.file)[1] for q in dataset.queries for s in q.decisive_spans
+    )
+    tool_line = ", ".join(f"{t}: {n}" for t, n in sorted(by_tool.items()))
+    span_line = ", ".join(f"`{e}`: {n}" for e, n in sorted(span_ext.items()))
+    config_line = " · ".join(f"`{r.label}`" for r in runs)
+
+    return f"""\
+## Setup
+
+**Corpus** ({corpus_dir.name}/): {sum(corpus_files.values())} files indexed.
+
+| ext | files | lines |
+|---|---|---|
+{corpus_rows}
+
+**Golden dataset**: {len(dataset.queries)} hand-written queries — by tool: \
+{tool_line}. Decisive gold spans by content type: {span_line}.
+
+**Configurations**: {config_line}. **Embedding model**: `{EMBEDDING_MODEL}`. \
+**Retrieval**: top-k swept over {", ".join(str(k) for k in top_k_values)}.
+"""
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
         prog="code-rag",
         description="Reusable MCP server for document RAG with Qdrant",
@@ -196,15 +334,21 @@ def main():
         help="Initialize a new code-rag project",
     )
     init_parser.add_argument(
-        "--project-dir", type=str, default=".",
+        "--project-dir",
+        type=str,
+        default=".",
         help="Project directory (default: current directory)",
     )
     init_parser.add_argument(
-        "--name", type=str, default=None,
+        "--name",
+        type=str,
+        default=None,
         help="MCP server name (default: <dir-name>-rag)",
     )
     init_parser.add_argument(
-        "--collection", type=str, default=None,
+        "--collection",
+        type=str,
+        default=None,
         help="Qdrant collection name (default: <dir_name>)",
     )
 
@@ -214,31 +358,44 @@ def main():
         help="Run the ingest pipeline (chunk, embed, index)",
     )
     ingest_parser.add_argument(
-        "--project-dir", type=str, default=None,
+        "--project-dir",
+        type=str,
+        default=None,
         help="Project directory (default: current directory)",
     )
     ingest_parser.add_argument(
-        "--no-recreate", action="store_true",
+        "--no-recreate",
+        action="store_true",
         help="Don't recreate the Qdrant collection (append to existing)",
     )
     ingest_parser.add_argument(
-        "--batch-size", type=int, default=10,
+        "--batch-size",
+        type=int,
+        default=10,
         help="Embedding batch size (default: 10)",
     )
     ingest_parser.add_argument(
-        "--min-chunk-lines", type=int, default=None,
-        help="Minimum chunk size in lines; smaller chunks merge into next sibling (default: from config or 20)",
+        "--min-chunk-lines",
+        type=int,
+        default=None,
+        help="Min chunk lines; smaller chunks merge into next sibling (default: config or 20)",
     )
     ingest_parser.add_argument(
-        "--max-chunk-lines", type=int, default=None,
-        help="Maximum chunk size in lines; larger chunks split at paragraph boundaries (default: from config or 100)",
+        "--max-chunk-lines",
+        type=int,
+        default=None,
+        help="Max chunk lines; larger chunks split at paragraph breaks (default: config or 100)",
     )
     ingest_parser.add_argument(
-        "--enrich", action="store_true", default=False,
+        "--enrich",
+        action="store_true",
+        default=False,
         help="Run LLM enrichment on chunks (adds summaries and hypothetical questions)",
     )
     ingest_parser.add_argument(
-        "--enrich-batch-size", type=int, default=None,
+        "--enrich-batch-size",
+        type=int,
+        default=None,
         help="Number of chunks per LLM enrichment call (default: 5)",
     )
 
@@ -248,8 +405,65 @@ def main():
         help="Start the MCP server (for debugging; normally started by Claude Code)",
     )
     serve_parser.add_argument(
-        "--project-dir", type=str, default=None,
+        "--project-dir",
+        type=str,
+        default=None,
         help="Project directory (default: current directory)",
+    )
+
+    # eval
+    eval_parser = subparsers.add_parser(
+        "eval",
+        help="Run retrieval evaluation against a golden dataset (needs API key + Qdrant)",
+    )
+    eval_parser.add_argument(
+        "--project-dir",
+        type=str,
+        default=None,
+        help="Project directory (default: current directory)",
+    )
+    eval_parser.add_argument(
+        "--dataset",
+        type=str,
+        default="tests/eval/golden_dataset.json",
+        help="Path to the golden dataset JSON (default: tests/eval/golden_dataset.json)",
+    )
+    eval_parser.add_argument(
+        "--top-k",
+        type=str,
+        default="3,5,7,10",
+        help="Comma-separated top_k values to sweep (default: 3,5,7,10)",
+    )
+    eval_parser.add_argument(
+        "--no-enrich",
+        action="store_true",
+        default=False,
+        help="Index the corpus without LLM enrichment (the key ablation)",
+    )
+    eval_parser.add_argument(
+        "--chunker",
+        choices=["ast", "line-based"],
+        default="ast",
+        help="Chunking strategy: AST-aware (default) or naive line windows",
+    )
+    eval_parser.add_argument(
+        "--matrix",
+        action="store_true",
+        default=False,
+        help="Run the standard ablation set (ast+enrich / ast / line-based) and compare",
+    )
+    eval_parser.add_argument(
+        "--enrich-batch-size",
+        type=int,
+        default=5,
+        help="Chunks per LLM enrichment call during eval indexing (default: 5)",
+    )
+    eval_parser.add_argument(
+        "--report-md",
+        type=str,
+        default="REPORT.md",
+        help="Write the full Markdown report to this path (default: REPORT.md at the cwd; "
+        "pass an empty string to skip)",
     )
 
     args = parser.parse_args()
@@ -260,6 +474,8 @@ def main():
         cmd_ingest(args)
     elif args.command == "serve":
         cmd_serve(args)
+    elif args.command == "eval":
+        cmd_eval(args)
     else:
         parser.print_help()
         sys.exit(1)

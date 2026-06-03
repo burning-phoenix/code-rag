@@ -1,0 +1,15 @@
+{
+  "name": "code-rag-eval",
+  "collection": "code_rag_eval",
+  "data_dir": "corpus",
+  "pointer_index": "pointer_index.json",
+  "qdrant_url": "http://eval-qdrant.orb.local:6333",
+  "description": "A local RAG server for eval. Use 'search_documents' for semantic search, 'search_code' for code-aware search with class context, or 'lookup_index' for exact concept-to-location lookups.",
+  "key_terms": [],
+  "file_extensions": [
+    ".py",
+    ".md",
+    ".lean"
+  ],
+  "enrich_chunks": false
+}
