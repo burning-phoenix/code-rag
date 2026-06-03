@@ -25,6 +25,13 @@ htmlcov/
 .env
 .env.*
 
+# code-rag generated artifacts (incl. the tests/eval project)
+# (gitignore has no inline comments — keep patterns on their own lines)
+qdrant_storage/
+pointer_index.json
+eval_pointer_index.json
+.mcp.json
+
 # IDEs
 .idea/
 .vscode/

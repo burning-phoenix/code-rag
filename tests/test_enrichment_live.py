@@ -8,29 +8,32 @@ Run with: pytest tests/test_enrichment_live.py -v -s
 """
 
 import asyncio
-import json
 import os
 import sys
+
+import pytest
 
 # Add src to path for direct execution
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from dotenv import load_dotenv
 
-from code_rag.chunker import Chunk
 from code_rag.enrichment import (
-    _build_batch_prompt,
     _call_llm_batch,
-    _parse_batch_response,
     enrich_chunks,
     get_embedding_text,
-    ENRICHMENT_SYSTEM_PROMPT,
 )
+from code_rag.models import Chunk
+from code_rag.providers import OpenRouterLLM
+
+# This module hits the real OpenRouter API — excluded from CI via `-m "not live"`.
+pytestmark = pytest.mark.live
 
 # Load API key
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 MODEL = "minimax/minimax-m2.7"
+llm = OpenRouterLLM(api_key=API_KEY)
 
 # ---------------------------------------------------------------------------
 # Synthetic chunks — realistic samples from different languages/types
@@ -185,26 +188,26 @@ def smooth(t, inflection=10.0):
 
 
 def print_separator(title: str):
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  {title}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
 
 async def test_single_batch():
     """Test a single batch of 5 diverse chunks."""
     print_separator("TEST 1: Single batch of 5 diverse chunks")
 
-    results = await _call_llm_batch(SYNTHETIC_CHUNKS, API_KEY, MODEL)
+    results = await _call_llm_batch(SYNTHETIC_CHUNKS, llm, MODEL)
 
     success = 0
-    for i, ((summary, questions), chunk) in enumerate(zip(results, SYNTHETIC_CHUNKS)):
-        print(f"--- Chunk {i+1}: {chunk.file_name} ({chunk.chunk_type}) ---")
+    for i, ((summary, questions), chunk) in enumerate(zip(results, SYNTHETIC_CHUNKS, strict=True)):
+        print(f"--- Chunk {i + 1}: {chunk.file_name} ({chunk.chunk_type}) ---")
         if summary:
             print(f"  Summary: {summary}")
             print(f"  Questions: {questions}")
             success += 1
         else:
-            print(f"  FAILED: No enrichment returned")
+            print("  FAILED: No enrichment returned")
         print()
 
     print(f"Result: {success}/{len(SYNTHETIC_CHUNKS)} chunks enriched")
@@ -219,69 +222,79 @@ async def test_small_batches():
     chunks = [
         Chunk(
             text="def add_updater(self, update_function, index=None, call_updater=True):\n"
-                 "    if index is None:\n"
-                 "        self.updaters.append(update_function)\n"
-                 "    else:\n"
-                 "        self.updaters.insert(index, update_function)\n"
-                 "    if call_updater:\n"
-                 "        update_function(self)\n"
-                 "    return self\n",
+            "    if index is None:\n"
+            "        self.updaters.append(update_function)\n"
+            "    else:\n"
+            "        self.updaters.insert(index, update_function)\n"
+            "    if call_updater:\n"
+            "        update_function(self)\n"
+            "    return self\n",
             file_name="manimlib/mobject/mobject.py",
             section_title="add_updater",
-            start_line=200, end_line=208,
-            chunk_type="code", language="python",
-            symbol_name="add_updater", symbol_type="method",
+            start_line=200,
+            end_line=208,
+            chunk_type="code",
+            language="python",
+            symbol_name="add_updater",
+            symbol_type="method",
         ),
         Chunk(
             text="precision mediump float;\n"
-                 "in vec2 uv_coords;\n"
-                 "uniform sampler2D Texture;\n"
-                 "out vec4 frag_color;\n\n"
-                 "void main() {\n"
-                 "    frag_color = texture(Texture, uv_coords);\n"
-                 "}\n",
+            "in vec2 uv_coords;\n"
+            "uniform sampler2D Texture;\n"
+            "out vec4 frag_color;\n\n"
+            "void main() {\n"
+            "    frag_color = texture(Texture, uv_coords);\n"
+            "}\n",
             file_name="manimlib/shaders/image/frag.glsl",
             section_title="image_frag",
-            start_line=1, end_line=8,
-            chunk_type="code", language="glsl",
-            symbol_name="main", symbol_type="function",
+            start_line=1,
+            end_line=8,
+            chunk_type="code",
+            language="glsl",
+            symbol_name="main",
+            symbol_type="function",
         ),
         Chunk(
             text="## Coordinate Systems\n\n"
-                 "Manim provides several coordinate system classes:\n\n"
-                 "- `Axes` — standard 2D Cartesian axes\n"
-                 "- `ThreeDAxes` — 3D Cartesian axes\n"
-                 "- `NumberPlane` — full 2D grid\n"
-                 "- `ComplexPlane` — complex number plane\n\n"
-                 "Use `coords_to_point(x, y)` (or `c2p`) to convert.\n",
+            "Manim provides several coordinate system classes:\n\n"
+            "- `Axes` — standard 2D Cartesian axes\n"
+            "- `ThreeDAxes` — 3D Cartesian axes\n"
+            "- `NumberPlane` — full 2D grid\n"
+            "- `ComplexPlane` — complex number plane\n\n"
+            "Use `coords_to_point(x, y)` (or `c2p`) to convert.\n",
             file_name="docs/coordinates.md",
             section_title="Coordinate Systems",
-            start_line=1, end_line=10,
-            chunk_type="markdown", language=None,
+            start_line=1,
+            end_line=10,
+            chunk_type="markdown",
+            language=None,
         ),
         Chunk(
-            text="[tool.poetry]\nname = \"manim\"\nversion = \"0.18.0\"\n"
-                 "description = \"Animation engine for explanatory math videos\"\n"
-                 "authors = [\"3Blue1Brown\"]\n"
-                 "license = \"MIT\"\n",
+            text='[tool.poetry]\nname = "manim"\nversion = "0.18.0"\n'
+            'description = "Animation engine for explanatory math videos"\n'
+            'authors = ["3Blue1Brown"]\n'
+            'license = "MIT"\n',
             file_name="pyproject.toml",
             section_title="pyproject.toml",
-            start_line=1, end_line=6,
-            chunk_type="plaintext", language=None,
+            start_line=1,
+            end_line=6,
+            chunk_type="plaintext",
+            language=None,
         ),
     ]
 
-    result = await enrich_chunks(chunks, API_KEY, MODEL, batch_size=2, max_concurrent=1)
+    result = await enrich_chunks(chunks, llm, MODEL, batch_size=2, max_concurrent=1)
 
     success = 0
     for i, chunk in enumerate(result):
-        print(f"--- Chunk {i+1}: {chunk.file_name} ---")
+        print(f"--- Chunk {i + 1}: {chunk.file_name} ---")
         if chunk.summary:
             print(f"  Summary: {chunk.summary}")
             print(f"  Questions: {chunk.hypothetical_questions}")
             success += 1
         else:
-            print(f"  FAILED: No enrichment")
+            print("  FAILED: No enrichment")
         print()
 
     print(f"Result: {success}/{len(chunks)} chunks enriched")
@@ -293,7 +306,7 @@ async def test_embedding_text_integration():
     print_separator("TEST 3: Embedding text integration")
 
     chunks = [SYNTHETIC_CHUNKS[0]]  # Just the VMobject class
-    result = await _call_llm_batch(chunks, API_KEY, MODEL)
+    result = await _call_llm_batch(chunks, llm, MODEL)
 
     summary, questions = result[0]
     if summary:
@@ -305,8 +318,8 @@ async def test_embedding_text_integration():
         print(f"Original text length: {len(chunk.text)} chars")
         print(f"Enriched text length: {len(embed_text)} chars")
         print(f"Added: {len(embed_text) - len(chunk.text)} chars of enrichment")
-        print(f"\n--- Enrichment portion ---")
-        enrichment = embed_text[len(chunk.text):]
+        print("\n--- Enrichment portion ---")
+        enrichment = embed_text[len(chunk.text) :]
         print(enrichment)
         return True
     else:
@@ -320,32 +333,35 @@ async def test_consistency():
 
     chunk = Chunk(
         text="def bezier(points):\n"
-             "    n = len(points) - 1\n"
-             "    return lambda t: sum(\n"
-             "        comb(n, k) * (1 - t)**(n - k) * t**k * p\n"
-             "        for k, p in enumerate(points)\n"
-             "    )\n",
+        "    n = len(points) - 1\n"
+        "    return lambda t: sum(\n"
+        "        comb(n, k) * (1 - t)**(n - k) * t**k * p\n"
+        "        for k, p in enumerate(points)\n"
+        "    )\n",
         file_name="manimlib/utils/bezier.py",
         section_title="bezier",
-        start_line=10, end_line=16,
-        chunk_type="code", language="python",
-        symbol_name="bezier", symbol_type="function",
+        start_line=10,
+        end_line=16,
+        chunk_type="code",
+        language="python",
+        symbol_name="bezier",
+        symbol_type="function",
     )
 
     summaries = []
     for run in range(3):
-        results = await _call_llm_batch([chunk], API_KEY, MODEL, max_retries=1)
+        results = await _call_llm_batch([chunk], llm, MODEL, max_retries=1)
         summary, questions = results[0]
         if summary:
             summaries.append(summary)
-            print(f"Run {run+1}: {summary}")
+            print(f"Run {run + 1}: {summary}")
         else:
-            print(f"Run {run+1}: FAILED")
+            print(f"Run {run + 1}: FAILED")
         # Small delay between runs for rate limiting
         await asyncio.sleep(2)
 
     if len(summaries) == 3:
-        print(f"\nAll 3 runs produced valid output")
+        print("\nAll 3 runs produced valid output")
         return True
     else:
         print(f"\n{3 - len(summaries)} runs failed")
@@ -382,9 +398,12 @@ impl Scene {
 }""",
             file_name="src/scene/scene.rs",
             section_title="Scene",
-            start_line=50, end_line=70,
-            chunk_type="code", language="rust",
-            symbol_name="Scene", symbol_type="class",
+            start_line=50,
+            end_line=70,
+            chunk_type="code",
+            language="rust",
+            symbol_name="Scene",
+            symbol_type="class",
         ),
         # 7. GLSL vertex shader
         Chunk(
@@ -415,9 +434,12 @@ void main() {
 }""",
             file_name="manimlib/shaders/quadratic_bezier/stroke/vert.glsl",
             section_title="bezier_stroke_vert",
-            start_line=1, end_line=25,
-            chunk_type="code", language="glsl",
-            symbol_name="main", symbol_type="function",
+            start_line=1,
+            end_line=25,
+            chunk_type="code",
+            language="glsl",
+            symbol_name="main",
+            symbol_type="function",
         ),
         # 8. Python complex math utility
         Chunk(
@@ -455,8 +477,10 @@ def get_smooth_quadratic_bezier_handle_points(points):
     return solve_banded((1, 1), ab, b)""",
             file_name="manimlib/utils/bezier.py",
             section_title="get_smooth_quadratic_bezier_handle_points",
-            start_line=45, end_line=78,
-            chunk_type="code", language="python",
+            start_line=45,
+            end_line=78,
+            chunk_type="code",
+            language="python",
             symbol_name="get_smooth_quadratic_bezier_handle_points",
             symbol_type="function",
         ),
@@ -465,17 +489,17 @@ def get_smooth_quadratic_bezier_handle_points(points):
     all_8 = SYNTHETIC_CHUNKS + extra_chunks
     assert len(all_8) == 8
 
-    results = await _call_llm_batch(all_8, API_KEY, MODEL)
+    results = await _call_llm_batch(all_8, llm, MODEL)
 
     success = 0
-    for i, ((summary, questions), chunk) in enumerate(zip(results, all_8)):
-        print(f"--- Chunk {i+1}: {chunk.file_name} ({chunk.language or chunk.chunk_type}) ---")
+    for i, ((summary, questions), chunk) in enumerate(zip(results, all_8, strict=True)):
+        print(f"--- Chunk {i + 1}: {chunk.file_name} ({chunk.language or chunk.chunk_type}) ---")
         if summary:
             print(f"  Summary: {summary}")
             print(f"  Questions: {questions}")
             success += 1
         else:
-            print(f"  FAILED: No enrichment returned")
+            print("  FAILED: No enrichment returned")
         print()
 
     print(f"Result: {success}/{len(all_8)} chunks enriched")

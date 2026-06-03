@@ -1,0 +1,4 @@
+# code-rag
+qdrant_storage/
+pointer_index.json
+.env

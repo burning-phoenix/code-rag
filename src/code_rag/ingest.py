@@ -7,31 +7,72 @@ Also generates the static pointer index.
 import asyncio
 import logging
 import sys
-from pathlib import Path
 
-from .chunk_router import chunk_directory
+from .chunkers import ChunkerRegistry, chunk_directory, get_registry
 from .config import ProjectConfig
-from .embeddings import embed_texts
-from .enrichment import get_embedding_text
-from .indexer import get_client, ensure_collection, upsert_chunks
+from .enrichment import enrich_chunks, get_embedding_text
+from .models import Chunk
 from .pointer_index import save_index
+from .protocols import EmbeddingProvider, LLMProvider, VectorStore
 
 logger = logging.getLogger(__name__)
 
 
+def _sync_incremental(
+    store: VectorStore,
+    collection: str,
+    chunks_with_embeddings: list[tuple[Chunk, list[float]]],
+) -> int:
+    """Make ``collection`` reflect exactly the current corpus, in place.
+
+    The sync *policy* lives here (in the orchestrator), not in the store: the
+    store only knows how to delete/list points. For each source file present in
+    this ingest, its existing points are dropped before re-upsert (so chunks
+    whose line ranges shifted on edit don't linger as orphans); then any source
+    path no longer present is purged (so deleted files are removed too).
+    """
+    by_source: dict[str, list[tuple[Chunk, list[float]]]] = {}
+    for chunk, embedding in chunks_with_embeddings:
+        # source_path is stamped by chunk_directory; fall back to file_name if not.
+        key = chunk.source_path or chunk.file_name
+        by_source.setdefault(key, []).append((chunk, embedding))
+
+    present = set(by_source)
+
+    # Prune files that vanished from the corpus since the last ingest.
+    for stale in store.list_source_paths(collection) - present:
+        removed = store.delete_by_source(collection, stale)
+        logger.info("Pruned %d orphan chunks from deleted file %s", removed, stale)
+
+    # Replace each present file's chunks wholesale.
+    indexed = 0
+    for source_path, items in by_source.items():
+        store.delete_by_source(collection, source_path)
+        indexed += store.upsert(collection, items)
+    return indexed
+
+
 async def ingest(
     config: ProjectConfig,
+    embedder: EmbeddingProvider,
+    store: VectorStore,
+    llm: LLMProvider | None = None,
     recreate_collection: bool = True,
     embedding_batch_size: int = 10,
     enrich_batch_size: int = 5,
+    registry: ChunkerRegistry | None = None,
 ) -> dict:
     """
     Run the full ingest pipeline:
     1. Chunk all files (markdown, code, plaintext)
     2. Generate static pointer index
-    3. (Optional) Enrich chunks with LLM summaries
-    4. Embed all chunks via OpenRouter
-    5. Index embeddings in Qdrant
+    3. (Optional) Enrich chunks with LLM summaries — only when ``llm`` is given
+    4. Embed all chunks via the embedding provider
+    5. Index embeddings in the vector store
+
+    The pipeline depends only on the injected protocol instances, so it can be
+    driven by real providers (CLI) or fakes (tests) with no code changes. Pass a
+    custom ``registry`` to swap chunking strategies (e.g. the eval ablation).
 
     Returns summary dict with counts.
     """
@@ -40,48 +81,51 @@ async def ingest(
     if not data_dir.exists():
         raise FileNotFoundError(f"Data directory not found: {data_dir}")
 
+    if registry is None:
+        registry = get_registry()
+
     # Step 1: Chunk all files
     logger.info(
         "Chunking files in %s (extensions: %s) ...",
-        data_dir, ", ".join(config.file_extensions),
+        data_dir,
+        ", ".join(config.file_extensions),
     )
-    chunks = chunk_directory(data_dir, config)
+    chunks = chunk_directory(data_dir, config, registry)
 
     code_chunks = sum(1 for c in chunks if c.chunk_type == "code")
     md_chunks = sum(1 for c in chunks if c.chunk_type == "markdown")
     pt_chunks = sum(1 for c in chunks if c.chunk_type == "plaintext")
     logger.info(
         "Created %d chunks (%d code, %d markdown, %d plaintext)",
-        len(chunks), code_chunks, md_chunks, pt_chunks,
+        len(chunks),
+        code_chunks,
+        md_chunks,
+        pt_chunks,
     )
 
     if not chunks:
         logger.warning(
             "No chunks created. Check that %s contains files with extensions: %s",
-            data_dir, ", ".join(config.file_extensions),
+            data_dir,
+            ", ".join(config.file_extensions),
         )
         return {"chunks": 0, "indexed": 0, "pointer_entries": 0}
 
     # Step 2: Generate static pointer index
     logger.info("Building static pointer index → %s", config.pointer_index)
-    pointer_count = save_index(
-        data_dir,
-        config.pointer_index,
-        key_terms=config.key_terms,
-        file_extensions=config.file_extensions,
-    )
+    pointer_count = save_index(data_dir, config.pointer_index, config, registry)
     logger.info("Indexed %d pointer entries", pointer_count)
 
-    # Step 3: Optional enrichment
-    if config.enrich_chunks:
-        from .enrichment import enrich_chunks
+    # Step 3: Optional enrichment (only when an LLM provider was injected)
+    if llm is not None:
         logger.info(
             "Enriching %d chunks with LLM summaries (model: %s) ...",
-            len(chunks), config.enrichment_model,
+            len(chunks),
+            config.enrichment_model,
         )
         chunks = await enrich_chunks(
             chunks,
-            api_key=config.openrouter_api_key,
+            llm,
             model=config.enrichment_model,
             batch_size=enrich_batch_size,
         )
@@ -94,11 +138,14 @@ async def ingest(
         batch = chunks[i : i + embedding_batch_size]
         texts = [get_embedding_text(c) for c in batch]
         try:
-            embeddings = await embed_texts(texts, api_key=config.openrouter_api_key)
+            embeddings = await embedder.embed(texts)
         except Exception as e:
             logger.error(
                 "Embedding failed at batch %d-%d / %d after retries: %s",
-                i, min(i + embedding_batch_size, len(chunks)), len(chunks), e,
+                i,
+                min(i + embedding_batch_size, len(chunks)),
+                len(chunks),
+                e,
             )
             raise
         all_embeddings.extend(embeddings)
@@ -108,14 +155,25 @@ async def ingest(
             len(chunks),
         )
 
-    # Step 5: Index in Qdrant
-    logger.info("Connecting to Qdrant at %s ...", config.qdrant_url)
-    client = get_client(config.qdrant_url)
-    ensure_collection(client, collection_name=config.collection, recreate=recreate_collection)
+    # Step 5: Index in the vector store
+    logger.info("Indexing %d chunks in collection '%s' ...", len(chunks), config.collection)
+    store.ensure_collection(
+        config.collection,
+        vector_size=embedder.dimension,
+        recreate=recreate_collection,
+    )
 
-    chunks_with_embeddings = list(zip(chunks, all_embeddings))
-    indexed = upsert_chunks(client, chunks_with_embeddings, collection_name=config.collection)
-    logger.info("Indexed %d chunks in Qdrant", indexed)
+    chunks_with_embeddings = list(zip(chunks, all_embeddings, strict=True))
+
+    if recreate_collection:
+        # Collection was just dropped and rebuilt — a plain upsert is the full state.
+        indexed = store.upsert(config.collection, chunks_with_embeddings)
+    else:
+        # Incremental sync: make the collection reflect exactly the current corpus.
+        # Per-file delete-then-upsert clears chunks whose line ranges shifted on
+        # edit; pruning paths no longer present removes deleted files' orphans.
+        indexed = _sync_incremental(store, config.collection, chunks_with_embeddings)
+    logger.info("Indexed %d chunks", indexed)
 
     return {
         "chunks": len(chunks),
@@ -135,9 +193,10 @@ def run_ingest(
     max_chunk_lines: int | None = None,
     enrich: bool | None = None,
     enrich_batch_size: int | None = None,
-):
-    """CLI-callable ingest runner."""
+) -> None:
+    """CLI-callable ingest runner — the composition root that wires providers."""
     from .config import load_config
+    from .providers import OpenRouterEmbeddings, OpenRouterLLM, QdrantVectorStore
 
     logging.basicConfig(
         level=logging.INFO,
@@ -155,14 +214,29 @@ def run_ingest(
     if enrich is not None:
         config.enrich_chunks = enrich
 
-    result = asyncio.run(ingest(
-        config=config,
-        recreate_collection=not no_recreate,
-        embedding_batch_size=batch_size,
-        enrich_batch_size=enrich_batch_size or 5,
-    ))
+    embedder = OpenRouterEmbeddings(api_key=config.openrouter_api_key)
+    store = QdrantVectorStore(config.qdrant_url)
 
-    print(f"\nIngest complete:", file=sys.stderr)
+    llm: OpenRouterLLM | None = None
+    if config.enrich_chunks:
+        if config.openrouter_api_key:
+            llm = OpenRouterLLM(api_key=config.openrouter_api_key)
+        else:
+            logger.warning("enrich_chunks is set but no API key — skipping enrichment")
+
+    result = asyncio.run(
+        ingest(
+            config=config,
+            embedder=embedder,
+            store=store,
+            llm=llm,
+            recreate_collection=not no_recreate,
+            embedding_batch_size=batch_size,
+            enrich_batch_size=enrich_batch_size or 5,
+        )
+    )
+
+    print("\nIngest complete:", file=sys.stderr)
     print(f"   Chunks created: {result['chunks']}", file=sys.stderr)
     print(f"     Code:      {result['code_chunks']}", file=sys.stderr)
     print(f"     Markdown:  {result['markdown_chunks']}", file=sys.stderr)

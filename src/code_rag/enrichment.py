@@ -15,14 +15,12 @@ import json
 import logging
 import re
 
-import httpx
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from .chunker import Chunk
+from .models import Chunk
+from .protocols import LLMProvider
 
 logger = logging.getLogger(__name__)
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 # ---------------------------------------------------------------------------
 # Soul + Constitution system prompt
@@ -109,7 +107,7 @@ def _parse_batch_response(
     try:
         raw = json.loads(content)
         parsed = BatchEnrichmentResponse.model_validate(raw)
-    except (json.JSONDecodeError, Exception):
+    except (json.JSONDecodeError, ValidationError):
         pass
 
     # Stage 2: regex extraction (model may have wrapped in markdown fences)
@@ -119,7 +117,7 @@ def _parse_batch_response(
             try:
                 raw = json.loads(match.group())
                 parsed = BatchEnrichmentResponse.model_validate(raw)
-            except (json.JSONDecodeError, Exception):
+            except (json.JSONDecodeError, ValidationError):
                 pass
 
     if parsed is None:
@@ -127,22 +125,18 @@ def _parse_batch_response(
 
     # Validate chunk count
     if len(parsed.chunks) != expected_count:
-        return None, (
-            f"Expected {expected_count} chunks but got {len(parsed.chunks)}"
-        )
+        return None, (f"Expected {expected_count} chunks but got {len(parsed.chunks)}")
 
-    # Sort by id, with positional fallback if ids are garbled
+    # Require the ids to be exactly 1..n so we can align summaries by id. Trusting
+    # positional order when ids are garbled would silently attach the wrong
+    # summary to the wrong chunk; treat it as a parse failure instead, which
+    # routes through retry-with-feedback and then the id-trivial per-chunk fallback.
     ids = {c.id for c in parsed.chunks}
     expected_ids = set(range(1, expected_count + 1))
+    if ids != expected_ids:
+        return None, (f"Chunk ids did not match 1..{expected_count} (got {sorted(ids)})")
 
-    if ids == expected_ids:
-        # Perfect ids — sort by id
-        results = sorted(parsed.chunks, key=lambda c: c.id)
-    else:
-        # Ids are wrong but count is correct — use positional order
-        results = parsed.chunks
-
-    return results, None
+    return sorted(parsed.chunks, key=lambda c: c.id), None
 
 
 # ---------------------------------------------------------------------------
@@ -178,12 +172,16 @@ def _build_batch_prompt(chunks: list[Chunk]) -> str:
 
 async def _call_llm_batch(
     chunks: list[Chunk],
-    api_key: str,
+    llm: LLMProvider,
     model: str,
     max_retries: int = 2,
 ) -> list[tuple[str | None, list[str] | None]]:
     """
-    Call OpenRouter with N chunks in a single request.
+    Enrich N chunks in a single LLM request.
+
+    Owns the enrichment orchestration: prompt construction, response parsing, and
+    the parse-failure retry-with-feedback loop. HTTP transport and rate limiting
+    are the ``llm`` provider's concern.
 
     Returns a list of (summary, questions) tuples aligned to input chunks.
     On total failure, returns (None, None) for each chunk.
@@ -197,58 +195,37 @@ async def _call_llm_batch(
         {"role": "user", "content": user_prompt},
     ]
 
-    timeout = 60.0 + 10.0 * n
-
     for attempt in range(1 + max_retries):
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(
-                    f"{OPENROUTER_BASE_URL}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": model,
-                        "messages": messages,
-                        "max_tokens": 300 + 200 * n,
-                        "temperature": 0.1,
-                        "response_format": {"type": "json_object"},
-                    },
-                )
-
-                # Rate limit handling
-                if response.status_code == 429:
-                    wait = 2 ** attempt
-                    logger.warning("Rate limited, waiting %ds before retry", wait)
-                    await asyncio.sleep(wait)
-                    continue
-
-                response.raise_for_status()
-                content = response.json()["choices"][0]["message"]["content"]
-
-        except Exception as e:
+            content = await llm.complete(
+                messages,
+                model=model,
+                max_tokens=300 + 200 * n,
+                temperature=0.1,
+                response_format={"type": "json_object"},
+                timeout=60.0 + 10.0 * n,
+            )
+        except Exception as e:  # noqa: BLE001 — any provider failure → fall back to None results
             logger.warning(
                 "Batch LLM call failed (attempt %d/%d): %s",
-                attempt + 1, 1 + max_retries, e,
+                attempt + 1,
+                1 + max_retries,
+                e,
             )
-            if attempt < max_retries:
-                await asyncio.sleep(2 ** attempt)
-            continue
+            break
 
-        # Parse response
         results, error_msg = _parse_batch_response(content, n)
 
         if results is not None:
-            return [
-                (r.summary, r.hypothetical_questions) for r in results
-            ]
+            return [(r.summary, r.hypothetical_questions) for r in results]
 
         # Parse failed — retry with error feedback
         if attempt < max_retries:
             logger.warning(
                 "Batch parse failed (attempt %d/%d): %s",
-                attempt + 1, 1 + max_retries, error_msg,
+                attempt + 1,
+                1 + max_retries,
+                error_msg,
             )
             messages = [
                 {"role": "system", "content": ENRICHMENT_SYSTEM_PROMPT},
@@ -268,7 +245,7 @@ async def _call_llm_batch(
 
 
 async def _call_llm_single(
-    chunk: Chunk, api_key: str, model: str
+    chunk: Chunk, llm: LLMProvider, model: str
 ) -> tuple[str | None, list[str] | None]:
     """
     Fallback: enrich a single chunk using the same soul+constitution prompt.
@@ -276,7 +253,7 @@ async def _call_llm_single(
     Reuses BatchEnrichmentResponse with a single-element array so the parsing
     pipeline is identical.
     """
-    results = await _call_llm_batch([chunk], api_key, model, max_retries=1)
+    results = await _call_llm_batch([chunk], llm, model, max_retries=1)
     return results[0]
 
 
@@ -303,7 +280,7 @@ def get_embedding_text(chunk: Chunk) -> str:
 
 async def enrich_chunks(
     chunks: list[Chunk],
-    api_key: str,
+    llm: LLMProvider,
     model: str,
     batch_size: int = 5,
     max_concurrent: int = 3,
@@ -316,10 +293,6 @@ async def enrich_chunks(
     Skips chunks shorter than 3 lines. On batch failure, falls back to
     individual chunk calls.
     """
-    if not api_key:
-        logger.warning("No API key provided, skipping enrichment")
-        return chunks
-
     semaphore = asyncio.Semaphore(max_concurrent)
     enriched_count = 0
     skipped_count = 0
@@ -345,7 +318,7 @@ async def enrich_chunks(
         batch_chunks = [chunk for _, chunk in batch]
 
         async with semaphore:
-            results = await _call_llm_batch(batch_chunks, api_key, model)
+            results = await _call_llm_batch(batch_chunks, llm, model)
 
         # Check if batch succeeded (at least one non-None result)
         all_failed = all(s is None and q is None for s, q in results)
@@ -357,16 +330,16 @@ async def enrich_chunks(
                 "Batch failed, falling back to individual calls for %d chunks",
                 len(batch_chunks),
             )
-            for (_, chunk), (summary, questions) in zip(batch, results):
+            for (_, chunk), (summary, questions) in zip(batch, results, strict=True):
                 async with semaphore:
-                    summary, questions = await _call_llm_single(chunk, api_key, model)
+                    summary, questions = await _call_llm_single(chunk, llm, model)
                 if summary is not None:
                     chunk.summary = summary
                     chunk.hypothetical_questions = questions
                     enriched_count += 1
         else:
             # Apply batch results
-            for (_, chunk), (summary, questions) in zip(batch, results):
+            for (_, chunk), (summary, questions) in zip(batch, results, strict=True):
                 if summary is not None:
                     chunk.summary = summary
                     chunk.hypothetical_questions = questions
@@ -378,11 +351,15 @@ async def enrich_chunks(
         processed = min((i + 1) * batch_size, len(enrichable))
         logger.info(
             "Enriched %d / %d chunks (skipped %d short)",
-            processed, len(enrichable), skipped_count,
+            processed,
+            len(enrichable),
+            skipped_count,
         )
 
     logger.info(
         "Enrichment complete: %d enriched, %d skipped, %d fallback calls",
-        enriched_count, skipped_count, fallback_count,
+        enriched_count,
+        skipped_count,
+        fallback_count,
     )
     return chunks

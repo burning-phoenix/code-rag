@@ -1,0 +1,53 @@
+[
+  {
+    "text": "\"\"\"Module docstring for the code chunker fixture.\"\"\"\n\nimport math\nfrom dataclasses import dataclass\n\nPI = 3.14159",
+    "file_name": "sample.py",
+    "section_title": "sample.py (module preamble)",
+    "start_line": 1,
+    "end_line": 6,
+    "math_density": 0.0,
+    "source_path": null,
+    "chunk_id": "chunk-0",
+    "chunk_type": "code",
+    "language": "python",
+    "symbol_name": "sample.py preamble",
+    "symbol_type": "module_preamble",
+    "parent_id": null,
+    "summary": null,
+    "hypothetical_questions": null
+  },
+  {
+    "text": "def top_level_function(x: float) -> float:\n    \"\"\"A top-level function: should become its own function chunk.\"\"\"\n    return math.sqrt(x) * PI",
+    "file_name": "sample.py",
+    "section_title": "top_level_function",
+    "start_line": 9,
+    "end_line": 11,
+    "math_density": 0.0,
+    "source_path": null,
+    "chunk_id": "chunk-1",
+    "chunk_type": "code",
+    "language": "python",
+    "symbol_name": "top_level_function",
+    "symbol_type": "function",
+    "parent_id": null,
+    "summary": null,
+    "hypothetical_questions": null
+  },
+  {
+    "text": "@dataclass\nclass Widget:\n    \"\"\"A class with several methods.\n\n    With a low max_chunk_lines this class exceeds the threshold and is split\n    into a parent chunk plus one child chunk per method.\n    \"\"\"\n\n    width: int\n    height: int\n\n    def area(self) -> int:\n        \"\"\"Return the rectangular area.\"\"\"\n        return self.width * self.height\n\n    def perimeter(self) -> int:\n        \"\"\"Return the perimeter.\"\"\"\n        return 2 * (self.width + self.height)\n\n    def scale(self, factor: int) -> \"Widget\":\n        \"\"\"Return a new Widget scaled by an integer factor.\"\"\"\n        return Widget(self.width * factor, self.height * factor)",
+    "file_name": "sample.py",
+    "section_title": "Widget",
+    "start_line": 14,
+    "end_line": 35,
+    "math_density": 0.0,
+    "source_path": null,
+    "chunk_id": "chunk-2",
+    "chunk_type": "code",
+    "language": "python",
+    "symbol_name": "Widget",
+    "symbol_type": "class",
+    "parent_id": null,
+    "summary": null,
+    "hypothetical_questions": null
+  }
+]

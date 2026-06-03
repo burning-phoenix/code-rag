@@ -1,0 +1,19 @@
+[
+  {
+    "text": "The first paragraph introduces the plaintext fixture. It is separated from the\nnext block by a single blank line, which is the only boundary the plaintext\nchunker understands.\n\nThe second paragraph is short.\n\nThe third paragraph is a little longer so that, taken together with the others,\nthe merge pass has something to combine when a reasonable minimum chunk size is\nconfigured for the test.\n\nThe fourth and final paragraph closes the file with one last block of prose.",
+    "file_name": "sample.txt",
+    "section_title": "sample.txt",
+    "start_line": 1,
+    "end_line": 11,
+    "math_density": 0.0,
+    "source_path": null,
+    "chunk_id": "chunk-0",
+    "chunk_type": "plaintext",
+    "language": null,
+    "symbol_name": null,
+    "symbol_type": null,
+    "parent_id": null,
+    "summary": null,
+    "hypothetical_questions": null
+  }
+]

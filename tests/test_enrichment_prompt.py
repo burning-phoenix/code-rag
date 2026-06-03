@@ -7,11 +7,9 @@ prompt produces parseable output and the fallback logic works correctly.
 """
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from code_rag.chunker import Chunk
 from code_rag.enrichment import (
     ENRICHMENT_SYSTEM_PROMPT,
     _build_batch_prompt,
@@ -19,7 +17,8 @@ from code_rag.enrichment import (
     enrich_chunks,
     get_embedding_text,
 )
-
+from code_rag.models import Chunk
+from code_rag.providers import FakeLLM
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -49,14 +48,16 @@ def _make_valid_response(n: int) -> str:
     """Build a well-formed JSON response for n chunks."""
     items = []
     for i in range(1, n + 1):
-        items.append({
-            "id": i,
-            "summary": f"This is chunk {i} which does something useful.",
-            "hypothetical_questions": [
-                f"What does chunk {i} do?",
-                f"When would I use chunk {i}?",
-            ],
-        })
+        items.append(
+            {
+                "id": i,
+                "summary": f"This is chunk {i} which does something useful.",
+                "hypothetical_questions": [
+                    f"What does chunk {i} do?",
+                    f"When would I use chunk {i}?",
+                ],
+            }
+        )
     return json.dumps({"chunks": items})
 
 
@@ -106,26 +107,24 @@ class TestParseBatchResponse:
 
     def test_parse_missing_fields(self):
         """Pydantic catches missing hypothetical_questions key."""
-        content = json.dumps({
-            "chunks": [
-                {"id": 1, "summary": "Does something."}
-            ]
-        })
+        content = json.dumps({"chunks": [{"id": 1, "summary": "Does something."}]})
         results, error = _parse_batch_response(content, 1)
         assert results is None
         assert error is not None
 
     def test_parse_empty_summary(self):
         """Validator rejects empty string summary."""
-        content = json.dumps({
-            "chunks": [
-                {
-                    "id": 1,
-                    "summary": "   ",
-                    "hypothetical_questions": ["Q1?"],
-                }
-            ]
-        })
+        content = json.dumps(
+            {
+                "chunks": [
+                    {
+                        "id": 1,
+                        "summary": "   ",
+                        "hypothetical_questions": ["Q1?"],
+                    }
+                ]
+            }
+        )
         results, error = _parse_batch_response(content, 1)
         assert results is None
         assert error is not None
@@ -152,31 +151,36 @@ class TestParseBatchResponse:
         assert [r.id for r in results] == [1, 2, 3]
         assert results[0].summary == "First."
 
-    def test_positional_fallback(self):
-        """Wrong IDs but correct count uses positional assignment."""
+    def test_garbled_ids_are_a_parse_failure(self):
+        """Right count but ids != 1..n fails rather than guessing by position.
+
+        Trusting positional order would silently attach the wrong summary to the
+        wrong chunk. We instead signal failure so the caller retries / falls back
+        to per-chunk calls where ids are trivial.
+        """
         items = [
             {"id": 10, "summary": "A.", "hypothetical_questions": ["Q1?"]},
             {"id": 20, "summary": "B.", "hypothetical_questions": ["Q2?"]},
         ]
         content = json.dumps({"chunks": items})
         results, error = _parse_batch_response(content, 2)
-        assert error is None
-        assert results is not None
-        assert len(results) == 2
-        assert results[0].summary == "A."
-        assert results[1].summary == "B."
+        assert results is None
+        assert error is not None
+        assert "ids" in error.lower()
 
     def test_extra_whitespace_in_summary(self):
         """Summary with leading/trailing whitespace is stripped."""
-        content = json.dumps({
-            "chunks": [
-                {
-                    "id": 1,
-                    "summary": "  Does something useful.  ",
-                    "hypothetical_questions": ["Q?"],
-                }
-            ]
-        })
+        content = json.dumps(
+            {
+                "chunks": [
+                    {
+                        "id": 1,
+                        "summary": "  Does something useful.  ",
+                        "hypothetical_questions": ["Q?"],
+                    }
+                ]
+            }
+        )
         results, error = _parse_batch_response(content, 1)
         assert error is None
         assert results is not None
@@ -193,9 +197,15 @@ class TestPromptConstruction:
         """5 varied chunks produce correct delimiters and metadata."""
         chunks = [
             _make_chunk(text="def foo(): pass", file_name="a.py", language="python"),
-            _make_chunk(text="void main() {}", file_name="b.glsl", language="glsl", chunk_type="code"),
-            _make_chunk(text="# Header\nSome docs", file_name="c.md", language=None, chunk_type="markdown"),
-            _make_chunk(text="plain text here", file_name="d.txt", language=None, chunk_type="plaintext"),
+            _make_chunk(
+                text="void main() {}", file_name="b.glsl", language="glsl", chunk_type="code"
+            ),
+            _make_chunk(
+                text="# Header\nSome docs", file_name="c.md", language=None, chunk_type="markdown"
+            ),
+            _make_chunk(
+                text="plain text here", file_name="d.txt", language=None, chunk_type="plaintext"
+            ),
             _make_chunk(text="fn main() {}", file_name="e.rs", language="rust"),
         ]
         prompt = _build_batch_prompt(chunks)
@@ -292,94 +302,89 @@ class TestGetEmbeddingText:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end mock test
+# enrich_chunks orchestration (with FakeLLM — no network)
 # ---------------------------------------------------------------------------
 
 
-def _mock_openrouter_response(n: int):
-    """Create a mock httpx response with valid enrichment for n chunks."""
-    body = _make_valid_response(n)
-    # Use MagicMock (not AsyncMock) because httpx response.json() is sync
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.raise_for_status = MagicMock()
-    mock_response.json.return_value = {
-        "choices": [{"message": {"content": body}}]
-    }
-    return mock_response
-
-
-class TestEndToEnd:
+class TestEnrichChunks:
     @pytest.mark.asyncio
     async def test_enrich_chunks_batched(self):
-        """Full pipeline with mocked HTTP — 7 chunks in batches of 3."""
+        """7 chunks in batches of 3 are all enriched via the LLM provider."""
         chunks = [
             _make_chunk(text=f"def func_{i}():\n    pass\n    # line 3\n", start_line=1, end_line=4)
             for i in range(7)
         ]
+        llm = FakeLLM()
 
-        # Mock will be called 3 times: batch(3) + batch(3) + batch(1)
-        call_count = 0
-
-        async def mock_post(url, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            # Determine batch size from the prompt
-            messages = kwargs.get("json", {}).get("messages", [])
-            user_msg = messages[-1]["content"] if messages else ""
-            # Count chunk delimiters
-            n = user_msg.count("--- CHUNK ")
-            return _mock_openrouter_response(n)
-
-        with patch("code_rag.enrichment.httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.post = mock_post
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
-
-            result = await enrich_chunks(
-                chunks, api_key="test-key", model="test-model", batch_size=3,
-            )
+        result = await enrich_chunks(chunks, llm, model="test-model", batch_size=3)
 
         assert len(result) == 7
-        # All chunks should be enriched
         for chunk in result:
             assert chunk.summary is not None
             assert chunk.hypothetical_questions is not None
             assert len(chunk.hypothetical_questions) >= 1
 
-        # Should have made 3 batch calls (3+3+1)
-        assert call_count == 3
+        # Three batch calls: 3 + 3 + 1
+        assert len(llm.calls) == 3
 
     @pytest.mark.asyncio
     async def test_skips_short_chunks(self):
-        """Chunks with < 3 lines are skipped."""
+        """Chunks with < 3 lines are not sent for enrichment."""
         chunks = [
             _make_chunk(text="short", start_line=1, end_line=2),  # 2 lines — skip
-            _make_chunk(text="def f():\n    pass\n    # 3\n", start_line=1, end_line=4),  # 4 lines — enrich
+            _make_chunk(text="def f():\n    pass\n    # 3\n", start_line=1, end_line=4),  # enrich
         ]
+        llm = FakeLLM()
 
-        async def mock_post(url, **kwargs):
-            return _mock_openrouter_response(1)
-
-        with patch("code_rag.enrichment.httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.post = mock_post
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
-
-            result = await enrich_chunks(
-                chunks, api_key="test-key", model="test-model", batch_size=5,
-            )
+        result = await enrich_chunks(chunks, llm, model="test-model", batch_size=5)
 
         assert result[0].summary is None  # skipped
         assert result[1].summary is not None  # enriched
 
     @pytest.mark.asyncio
-    async def test_no_api_key_skips(self):
-        """Empty API key skips enrichment entirely."""
-        chunks = [_make_chunk(start_line=1, end_line=10)]
-        result = await enrich_chunks(chunks, api_key="", model="test-model")
+    async def test_unparseable_response_leaves_chunks_unenriched(self):
+        """A response that can never be parsed leaves chunks un-enriched (graceful)."""
+        chunks = [_make_chunk(text="def f():\n    pass\n    # 3\n", start_line=1, end_line=4)]
+        llm = FakeLLM(response="this is not JSON at all")
+
+        result = await enrich_chunks(chunks, llm, model="test-model")
+
         assert result[0].summary is None
+
+    @pytest.mark.asyncio
+    async def test_garbled_batch_ids_fall_back_to_per_chunk(self):
+        """A batch with garbled ids must not misattribute; it falls back to singles.
+
+        The fake returns the right count but wrong ids for multi-chunk batches
+        (which must be rejected) and valid ids for single-chunk calls. Each chunk
+        should end up with the single-call summary, never a positionally-guessed
+        batch summary.
+        """
+
+        class GarbledBatchLLM:
+            def __init__(self) -> None:
+                self.calls: list[list[dict]] = []
+
+            async def complete(self, messages: list[dict], model: str, **kwargs) -> str:
+                self.calls.append(messages)
+                n = messages[-1]["content"].count("--- CHUNK ")
+                if n <= 1:
+                    items = [{"id": 1, "summary": "from-single", "hypothetical_questions": ["q?"]}]
+                else:
+                    # Correct count, garbled ids — must be treated as a parse failure.
+                    items = [
+                        {"id": 100 + i, "summary": "from-batch", "hypothetical_questions": ["q?"]}
+                        for i in range(n)
+                    ]
+                return json.dumps({"chunks": items})
+
+        chunks = [
+            _make_chunk(text=f"def f{i}():\n    pass\n    # 3\n", start_line=1, end_line=4)
+            for i in range(2)
+        ]
+        llm = GarbledBatchLLM()
+
+        result = await enrich_chunks(chunks, llm, model="test-model", batch_size=2)
+
+        assert all(c.summary == "from-single" for c in result)
+        assert all(c.summary != "from-batch" for c in result)

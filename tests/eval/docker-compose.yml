@@ -1,0 +1,7 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: eval-qdrant
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+    restart: unless-stopped

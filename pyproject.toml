@@ -12,8 +12,20 @@ dependencies = [
     "qdrant-client",
     "httpx",
     "python-dotenv",
-    "tree-sitter>=0.24.0",
-    "tree-sitter-language-pack>=0.24.0",
+    "pydantic>=2",
+    # Pinned: tree-sitter's parse() API flipped from bytes to str after 0.25.2,
+    # which broke CI on 3.12 (newer wheel) while 3.11 still resolved an older one.
+    # Our chunkers pass bytes; keep the whole matrix on the tested, bytes combo.
+    "tree-sitter==0.25.2",
+    "tree-sitter-language-pack==1.3.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.11",
+    "mypy>=1.10",
 ]
 
 [project.scripts]
@@ -22,5 +34,36 @@ code-rag = "code_rag.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/code_rag"]
 
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+# The eval corpus is third-party sample data (torch/micrograd/Mathlib), not our
+# source — never lint or format it.
+extend-exclude = ["tests/eval/corpus"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "BLE",  # flake8-blind-except (catches bare `except Exception`)
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true    # tree-sitter and MCP stubs are incomplete
+disallow_untyped_defs = true     # every function must be annotated
+check_untyped_defs = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "live: marks tests that require external services (deselect with '-m not live')",
+]
