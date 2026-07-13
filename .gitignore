@@ -43,3 +43,4 @@ eval_pointer_index.json
 /docker-compose.yml
 /frontend/
 frontend/
+tests/eval/REPORT-*.md
