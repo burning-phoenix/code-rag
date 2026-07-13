@@ -25,11 +25,13 @@ def _sync_incremental(
 ) -> int:
     """Make ``collection`` reflect exactly the current corpus, in place.
 
-    The sync *policy* lives here (in the orchestrator), not in the store: the
-    store only knows how to delete/list points. For each source file present in
-    this ingest, its existing points are dropped before re-upsert (so chunks
-    whose line ranges shifted on edit don't linger as orphans); then any source
-    path no longer present is purged (so deleted files are removed too).
+    The decision of *what* to sync lives here in the pipeline, not in the
+    store: the store only knows how to delete and list points. For each source
+    file present in this ingest, its existing points are deleted before the
+    new ones are inserted (so chunks whose line ranges moved after an edit
+    don't survive as stale entries); then every stored source path no longer
+    present on disk is removed (so deleted files disappear from the index
+    too).
     """
     by_source: dict[str, list[tuple[Chunk, list[float]]]] = {}
     for chunk, embedding in chunks_with_embeddings:
@@ -39,10 +41,10 @@ def _sync_incremental(
 
     present = set(by_source)
 
-    # Prune files that vanished from the corpus since the last ingest.
+    # Remove files deleted from the corpus since the last ingest.
     for stale in store.list_source_paths(collection) - present:
         removed = store.delete_by_source(collection, stale)
-        logger.info("Pruned %d orphan chunks from deleted file %s", removed, stale)
+        logger.info("Removed %d stale chunks from deleted file %s", removed, stale)
 
     # Replace each present file's chunks wholesale.
     indexed = 0
@@ -59,7 +61,7 @@ async def ingest(
     llm: LLMProvider | None = None,
     recreate_collection: bool = True,
     embedding_batch_size: int = 10,
-    enrich_batch_size: int = 5,
+    enrich_batch_size: int = 10,
     registry: ChunkerRegistry | None = None,
 ) -> dict:
     """
@@ -70,9 +72,10 @@ async def ingest(
     4. Embed all chunks via the embedding provider
     5. Index embeddings in the vector store
 
-    The pipeline depends only on the injected protocol instances, so it can be
-    driven by real providers (CLI) or fakes (tests) with no code changes. Pass a
-    custom ``registry`` to swap chunking strategies (e.g. the eval ablation).
+    The pipeline depends only on the interfaces passed in, so it can be driven
+    by real providers (CLI) or fakes (tests) with no code changes. Pass a
+    custom ``registry`` to swap chunking strategies (the evaluation's
+    comparison runs do this).
 
     Returns summary dict with counts.
     """
@@ -170,8 +173,9 @@ async def ingest(
         indexed = store.upsert(config.collection, chunks_with_embeddings)
     else:
         # Incremental sync: make the collection reflect exactly the current corpus.
-        # Per-file delete-then-upsert clears chunks whose line ranges shifted on
-        # edit; pruning paths no longer present removes deleted files' orphans.
+        # Deleting each present file's points before re-inserting clears chunks
+        # whose line ranges moved after an edit; removing paths no longer present
+        # clears the chunks of deleted files.
         indexed = _sync_incremental(store, config.collection, chunks_with_embeddings)
     logger.info("Indexed %d chunks", indexed)
 
@@ -194,7 +198,7 @@ def run_ingest(
     enrich: bool | None = None,
     enrich_batch_size: int | None = None,
 ) -> None:
-    """CLI-callable ingest runner — the composition root that wires providers."""
+    """CLI entry point: builds the real providers and runs the ingest pipeline."""
     from .config import load_config
     from .providers import OpenRouterEmbeddings, OpenRouterLLM, QdrantVectorStore
 
@@ -232,7 +236,7 @@ def run_ingest(
             llm=llm,
             recreate_collection=not no_recreate,
             embedding_batch_size=batch_size,
-            enrich_batch_size=enrich_batch_size or 5,
+            enrich_batch_size=enrich_batch_size or 10,
         )
     )
 

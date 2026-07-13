@@ -1,9 +1,27 @@
 """
 Golden dataset: hand-written query → relevant-span pairs.
 
-Relevance is labelled at the *span* level (file + symbol or file + line range),
-not the chunk level, so the dataset stays valid when chunking parameters change.
-Any retrieved item overlapping a gold span counts as a hit.
+Relevance is labelled at the *span* level (file + line range, with an optional
+symbol kept as documentation), not the chunk level, so the dataset stays valid
+when chunking parameters change. Scoring is line-geometry only — symbols are
+never consulted (see eval/metrics.py).
+
+Labeling rules (every span must follow these):
+
+1. **Decisive spans are answer-sized**: the minimal contiguous region that
+   states the answer — never sized to a parser's unit (a whole function or
+   section), so no chunker's native output equals gold by construction.
+2. **Every decisive span carries a line range.** A rangeless span is
+   unscorable under geometry-only matching.
+3. **Every independently-sufficient location is decisive.** If two places each
+   fully answer the query, both are labeled, so a retriever finding either is
+   credited.
+4. **Enclosing nodes and surrounding context are supportive** (grade 1) — the
+   function around the answering lines, the section around the theorem.
+
+The dataset is hand-written, never LLM-generated: LLM-authored queries would
+share phrasing with LLM-authored enrichment summaries and bias that ablation
+in its own favor.
 """
 
 import json

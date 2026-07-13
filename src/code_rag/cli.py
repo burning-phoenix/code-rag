@@ -184,7 +184,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
     Diagnostic only — requires an API key (to embed queries) and a running
     Qdrant. Indexes the dataset's corpus into an isolated collection, runs each
-    query, and prints a metric table swept over the requested top_k values.
+    query, and prints a metric table computed at each requested top_k value.
     """
     import asyncio
     import logging
@@ -192,8 +192,8 @@ def cmd_eval(args: argparse.Namespace) -> None:
     from .chunkers import chunk_directory
     from .config import load_config
     from .eval.dataset import load_dataset
-    from .eval.metrics import QueryResult
-    from .eval.report import build_markdown_report, chunk_geometry
+    from .eval.metrics import QueryResult, load_corpus_weights
+    from .eval.report import CANARY_LABEL, build_markdown_report, chunk_geometry
     from .eval.runner import EvalRunner, RunConfig
     from .providers import OpenRouterEmbeddings, OpenRouterLLM, QdrantVectorStore
 
@@ -236,24 +236,55 @@ def cmd_eval(args: argparse.Namespace) -> None:
     store = QdrantVectorStore(config.qdrant_url)
     llm = OpenRouterLLM(api_key=config.openrouter_api_key)
 
-    # --matrix runs the standard ablation set; otherwise a single config from flags.
+    # --matrix runs the standard comparison set; otherwise a single config from
+    # flags. The whole-file configuration is always included: it exists to test
+    # the metrics themselves (see canary_check in eval/report.py).
+    # With --enrichment-models, one enriched column is added per model, labeled
+    # with the model that wrote the enrichment, so reports are self-documenting.
+    # The shared configs (ast / line-based / whole-file) are computed once.
+    enrich_models = (
+        [m.strip() for m in args.enrichment_models.split(",") if m.strip()]
+        if args.enrichment_models
+        else [config.enrichment_model]
+    )
+
+    def enrich_tag(model: str) -> str:
+        return f"+enrich[{model.split('/')[-1]}]"
+
     if args.matrix:
         runs = [
-            RunConfig(label="ast+enrich", enrich=True, chunker="ast"),
+            RunConfig(label=f"ast{enrich_tag(m)}", enrich=True, chunker="ast", enrichment_model=m)
+            for m in enrich_models
+        ] + [
             RunConfig(label="ast", enrich=False, chunker="ast"),
             RunConfig(label="line-based", enrich=False, chunker="line-based"),
+            RunConfig(label=CANARY_LABEL, enrich=False, chunker="whole-file"),
         ]
     else:
-        label = args.chunker + ("" if args.no_enrich else "+enrich")
-        runs = [RunConfig(label=label, enrich=not args.no_enrich, chunker=args.chunker)]
+        model = enrich_models[0]
+        label = args.chunker + ("" if args.no_enrich else enrich_tag(model))
+        runs = [
+            RunConfig(
+                label=label,
+                enrich=not args.no_enrich,
+                chunker=args.chunker,
+                enrichment_model=model,
+            )
+        ]
 
     runner = EvalRunner(config, embedder, store, llm=llm, enrich_batch_size=args.enrich_batch_size)
+
+    # Query vectors are config-independent: embed all queries once, batched,
+    # and reuse them for every configuration in the matrix.
+    query_vectors = asyncio.run(runner.embed_queries(dataset))
 
     results_by_label: dict[str, list[QueryResult]] = {}
     geometry_by_label: dict[str, dict[str, float]] = {}
     geometry_by_chunker: dict[str, dict[str, float]] = {}
     for run in runs:
-        results_by_label[run.label] = asyncio.run(runner.evaluate(dataset, run, max(top_k_values)))
+        results_by_label[run.label] = asyncio.run(
+            runner.evaluate(dataset, run, max(top_k_values), query_vectors)
+        )
         # Geometry depends only on the chunker (enrichment doesn't move boundaries),
         # so compute once per distinct chunker and reuse. No API — pure chunking.
         if run.chunker not in geometry_by_chunker:
@@ -262,7 +293,10 @@ def cmd_eval(args: argparse.Namespace) -> None:
         geometry_by_label[run.label] = geometry_by_chunker[run.chunker]
 
     setup_md = _eval_setup_md(config, dataset, corpus_dir, runs, top_k_values)
-    report = build_markdown_report(results_by_label, geometry_by_label, top_k_values, setup_md)
+    weights = load_corpus_weights(corpus_dir)
+    report = build_markdown_report(
+        results_by_label, geometry_by_label, top_k_values, setup_md, weights
+    )
     print(report)
     if args.report_md:
         Path(args.report_md).write_text(report, encoding="utf-8")
@@ -303,6 +337,9 @@ def _eval_setup_md(
     tool_line = ", ".join(f"{t}: {n}" for t, n in sorted(by_tool.items()))
     span_line = ", ".join(f"`{e}`: {n}" for e, n in sorted(span_ext.items()))
     config_line = " · ".join(f"`{r.label}`" for r in runs)
+    enrich_line = " · ".join(
+        f"`{r.enrichment_model or config.enrichment_model}`" for r in runs if r.enrich
+    )
 
     return f"""\
 ## Setup
@@ -317,7 +354,8 @@ def _eval_setup_md(
 {tool_line}. Decisive gold spans by content type: {span_line}.
 
 **Configurations**: {config_line}. **Embedding model**: `{EMBEDDING_MODEL}`. \
-**Retrieval**: top-k swept over {", ".join(str(k) for k in top_k_values)}.
+**Enrichment model(s)**: {enrich_line or "none (no enrich run)"}. \
+**Retrieval**: top-k evaluated at {", ".join(str(k) for k in top_k_values)}.
 """
 
 
@@ -366,7 +404,8 @@ def main() -> None:
     ingest_parser.add_argument(
         "--no-recreate",
         action="store_true",
-        help="Don't recreate the Qdrant collection (append to existing)",
+        help="Update the existing collection in place instead of rebuilding it "
+        "(replaces chunks of changed files, removes chunks of deleted files)",
     )
     ingest_parser.add_argument(
         "--batch-size",
@@ -396,7 +435,7 @@ def main() -> None:
         "--enrich-batch-size",
         type=int,
         default=None,
-        help="Number of chunks per LLM enrichment call (default: 5)",
+        help="Number of chunks per LLM enrichment call (default: 10)",
     )
 
     # serve
@@ -438,25 +477,34 @@ def main() -> None:
         "--no-enrich",
         action="store_true",
         default=False,
-        help="Index the corpus without LLM enrichment (the key ablation)",
+        help="Index the corpus without LLM enrichment, to compare against enriched runs",
     )
     eval_parser.add_argument(
         "--chunker",
-        choices=["ast", "line-based"],
+        choices=["ast", "line-based", "whole-file"],
         default="ast",
-        help="Chunking strategy: AST-aware (default) or naive line windows",
+        help="Chunking strategy: structure-aware (default), fixed line windows, or "
+        "whole files (the metric self-check)",
     )
     eval_parser.add_argument(
         "--matrix",
         action="store_true",
         default=False,
-        help="Run the standard ablation set (ast+enrich / ast / line-based) and compare",
+        help="Run the standard comparison set (ast+enrich / ast / line-based / "
+        "whole-file), changing one thing at a time, and compare",
     )
     eval_parser.add_argument(
         "--enrich-batch-size",
         type=int,
-        default=5,
-        help="Chunks per LLM enrichment call during eval indexing (default: 5)",
+        default=10,
+        help="Chunks per LLM enrichment call during eval indexing (default: 10)",
+    )
+    eval_parser.add_argument(
+        "--enrichment-models",
+        type=str,
+        default=None,
+        help="Comma-separated enrichment models to compare; --matrix adds one "
+        "enrich column per model (default: the project config's enrichment_model)",
     )
     eval_parser.add_argument(
         "--report-md",

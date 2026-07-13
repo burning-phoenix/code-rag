@@ -3,7 +3,7 @@ Core data models shared across the pipeline.
 
 These are deliberately flat dataclasses with ``None`` defaults: every downstream
 consumer (chunkers, enrichment, indexer, server) handles all chunk types
-uniformly, so subclassing per content type would add ceremony without benefit.
+uniformly, so a subclass per content type would add complexity without benefit.
 """
 
 import hashlib

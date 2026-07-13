@@ -2,12 +2,14 @@
 Metadata enrichment: generates LLM summaries and hypothetical questions for
 chunks at ingest time using batched API calls with structured JSON output.
 
-Uses the soul+constitution prompting paradigm for reliable structured output:
-- Soul: stable identity ("CodeSage") primes technical summarization
-- Constitution: strict rules enforce JSON format compliance (~99% first-try)
-- Retry with error feedback on the rare parse failure
+The system prompt combines a fixed persona ("CodeSage", which steers the model
+toward technical summarisation) with a numbered list of strict output rules
+that require a bare JSON object. In testing this produced valid JSON on the
+first attempt roughly 99% of the time; the rare parse failure is retried once
+with the error message included, and a batch that fails twice falls back to
+one call per chunk.
 
-Batching N chunks per LLM call divides API costs by N.
+Batching N chunks per LLM call cuts the number of API calls by a factor of N.
 """
 
 import asyncio
@@ -23,8 +25,12 @@ from .protocols import LLMProvider
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Soul + Constitution system prompt
+# System prompt (persona + strict output rules)
 # ---------------------------------------------------------------------------
+#
+# The prompt text itself is part of the measured behaviour: the parse-success
+# rate and the evaluation results were produced with exactly this wording.
+# Treat changes to it like changes to code — re-run the evaluation after.
 
 ENRICHMENT_SYSTEM_PROMPT = """\
 You are CodeSage, a technical documentation engine that analyzes source code \
@@ -248,7 +254,7 @@ async def _call_llm_single(
     chunk: Chunk, llm: LLMProvider, model: str
 ) -> tuple[str | None, list[str] | None]:
     """
-    Fallback: enrich a single chunk using the same soul+constitution prompt.
+    Fallback: enrich a single chunk using the same system prompt.
 
     Reuses BatchEnrichmentResponse with a single-element array so the parsing
     pipeline is identical.
@@ -282,7 +288,7 @@ async def enrich_chunks(
     chunks: list[Chunk],
     llm: LLMProvider,
     model: str,
-    batch_size: int = 5,
+    batch_size: int = 10,
     max_concurrent: int = 3,
 ) -> list[Chunk]:
     """

@@ -1,14 +1,16 @@
 """
-Abstractions the orchestrators depend on (Dependency Inversion).
+The interfaces the pipeline code depends on.
 
-``ingest``, ``server``, and ``enrichment`` are written against these contracts,
-never against concrete OpenRouter/Qdrant clients. Concrete implementations live
-in :mod:`code_rag.providers`; test doubles live there too.
+``ingest``, ``server``, and ``enrichment`` are written against these interfaces,
+never against concrete OpenRouter/Qdrant clients — so a backend can be swapped
+without touching pipeline code. Concrete implementations live in
+:mod:`code_rag.providers`; test doubles live there too.
 
-The service contracts are :class:`typing.Protocol` (structural): a class is a
-valid provider if it has the right methods — no inheritance required. The chunker
-contract is an :class:`abc.ABC` instead, because chunkers are explicitly
-registered and we want the interface enforced at definition time.
+The service interfaces are :class:`typing.Protocol` classes, which Python
+checks by shape: a class is a valid provider if it has the right methods — no
+inheritance required. The chunker interface is an :class:`abc.ABC` instead,
+because chunkers are explicitly registered and we want the interface enforced
+at class-definition time.
 """
 
 from abc import ABC, abstractmethod
@@ -37,8 +39,8 @@ class EmbeddingProvider(Protocol):
 class VectorStore(Protocol):
     """A vector collection that supports indexing and similarity search.
 
-    The four operations are cohesive — all act on the same collection resource —
-    so they share one interface rather than being split per ISP.
+    The four operations all act on the same collection resource, so they share
+    one interface rather than being split into several smaller ones.
     """
 
     def ensure_collection(self, name: str, vector_size: int, recreate: bool = False) -> None:

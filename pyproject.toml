@@ -24,8 +24,12 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "ruff>=0.11",
-    "mypy>=1.10",
+    # Pinned: CI installs these fresh on every run, so unpinned versions mean
+    # a run can go red without any change to our code (ruff's formatter output
+    # and mypy's parser both shift between releases). Bump deliberately: update
+    # the pin, run the full gate locally, commit both together.
+    "ruff==0.15.21",
+    "mypy==2.2.0",
 ]
 
 [project.scripts]
@@ -60,6 +64,15 @@ warn_unused_configs = true
 ignore_missing_imports = true    # tree-sitter and MCP stubs are incomplete
 disallow_untyped_defs = true     # every function must be annotated
 check_untyped_defs = true
+
+# numpy arrives transitively via qdrant-client; we never import it. Its stubs
+# use 3.12-only `type` syntax, which is a hard parse error under our 3.11
+# target, so skip the stubs entirely rather than following the import.
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

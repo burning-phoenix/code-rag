@@ -1,15 +1,30 @@
 """
-Retrieval metrics over span-level graded relevance.
+Retrieval metrics over hand-labelled, graded relevance spans.
+
+The intended consumer of retrieval is an LLM agent: it reads the whole top-k
+result set at once, pays (in context window and API cost) for every token, and
+must trust each result without seeing the file around it. Retrieval can fail
+that consumer in three distinct, measurable ways, so there are three metrics,
+each computed at every k:
+
+- **coverage** — did the answer's tokens arrive in the top-k results?
+- **concentration** — what fraction of all retrieved tokens was answer?
+- **wholeness** — did each answer that arrived arrive inside a single result?
 
 A retrieved item (a chunk payload or pointer entry, normalised to a dict with
-``file_name``/``start_line``/``end_line``/``symbol_name``) *hits* a gold span when
-it is in the same file and either overlaps the span's line range or references
-its symbol name. Primary metric is recall@k of decisive spans — Claude reads the
-top-k as a set, so coverage matters more than rank.
+``file_name``/``start_line``/``end_line``) matches a gold span only when both
+point at the same file and their line ranges overlap. Symbol names are never
+used in matching: only the AST chunkers record them, so scoring through symbol
+names would favour those chunkers over strategies that have no symbols to
+report.
+
+Scores are weighted by whitespace-separated tokens per line, not by line
+count: a markdown "line" in this corpus is often a whole paragraph while a
+Python line is around 40 characters, so line counts are not comparable across
+the corpus's file types.
 """
 
-import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,13 +33,30 @@ from .dataset import Query, Span
 DECISIVE = 2
 SUPPORTIVE = 1
 
+# basename -> whitespace-token count per line (index 0 = line 1)
+LineWeights = Mapping[str, list[int]]
+
 
 @dataclass
 class QueryResult:
     """A query paired with the ranked items retrieved for it."""
 
     query: Query
-    retrieved: list[dict]  # rank-ordered; each has file_name/start_line/end_line/symbol_name
+    retrieved: list[dict]  # rank-ordered; each has file_name/start_line/end_line
+
+
+def load_corpus_weights(corpus_dir: str | Path) -> dict[str, list[int]]:
+    """Per-line whitespace-token counts for every corpus file, keyed by basename.
+
+    Basename keying mirrors ``_same_file``'s fallback; the eval corpus keeps
+    basenames unique, so no collision handling is attempted.
+    """
+    weights: dict[str, list[int]] = {}
+    for p in sorted(Path(corpus_dir).rglob("*")):
+        if p.is_file():
+            text = p.read_text(encoding="utf-8", errors="replace")
+            weights[p.name] = [len(line.split()) for line in text.splitlines()]
+    return weights
 
 
 def _same_file(item: dict, span: Span) -> bool:
@@ -41,91 +73,174 @@ def _same_file(item: dict, span: Span) -> bool:
     return Path(item_name).name == Path(span.file).name
 
 
-def _line_overlap(item: dict, span: Span) -> bool:
-    if span.start_line is None or span.end_line is None:
-        return False
-    istart = item.get("start_line")
-    iend = item.get("end_line")
-    if istart is None or iend is None:
-        return False
-    return bool(istart <= span.end_line and span.start_line <= iend)
+def _item_range(item: dict) -> tuple[int, int] | None:
+    start, end = item.get("start_line"), item.get("end_line")
+    if start is None or end is None:
+        return None
+    return int(start), int(end)
 
 
-def line_iou(item: dict, span: Span) -> float:
-    """Intersection-over-union of the item's and span's inclusive line ranges.
-
-    Pure geometry (ignores symbol match): 0.0 for a different file, a missing
-    range on either side, or no overlap. Rewards tightly-bounded retrieval — a
-    40-line window over a 5-line span scores 5/40, a 6-line method over it 5/6.
-    """
-    if not _same_file(item, span):
-        return 0.0
-    if span.start_line is None or span.end_line is None:
-        return 0.0
-    istart, iend = item.get("start_line"), item.get("end_line")
-    if istart is None or iend is None:
-        return 0.0
-    istart, iend = int(istart), int(iend)
-    inter = min(iend, span.end_line) - max(istart, span.start_line) + 1
-    if inter <= 0:
-        return 0.0
-    union = (iend - istart + 1) + (span.end_line - span.start_line + 1) - inter
-    return inter / union
+def _has_range(span: Span) -> bool:
+    return span.start_line is not None and span.end_line is not None
 
 
-def _symbol_match(item: dict, span: Span) -> bool:
-    if not span.symbol:
-        return False
-    name = item.get("symbol_name") or ""
-    # Match "Widget" against "Widget" and "Widget.area" (and vice versa).
-    return span.symbol == name or span.symbol in name or name in span.symbol
-
-
-def item_hits_span(item: dict, span: Span) -> bool:
-    """True when a retrieved item overlaps a gold span (line range or symbol)."""
-    if not _same_file(item, span):
-        return False
-    return _line_overlap(item, span) or _symbol_match(item, span)
+def _line_tokens(weights: LineWeights, file: str, start: int, end: int) -> int:
+    """Whitespace tokens on lines ``start..end`` (inclusive, 1-indexed) of ``file``."""
+    per_line = weights[Path(file).name]
+    return sum(per_line[start - 1 : end])
 
 
 def _spans(query: Query, grade: int) -> list[Span]:
     return query.decisive_spans if grade == DECISIVE else query.supportive_spans
 
 
-def hit_rate(results: list[QueryResult], grade: int = DECISIVE) -> float:
-    """Fraction of queries with at least one top-result hit on a span of ``grade``."""
-    considered = [r for r in results if _spans(r.query, grade)]
-    if not considered:
-        return 0.0
-    hits = sum(
-        any(any(item_hits_span(it, s) for s in _spans(r.query, grade)) for it in r.retrieved)
-        for r in considered
-    )
-    return hits / len(considered)
+def _graded_spans(
+    results: list[QueryResult],
+    grade: int,
+    span_filter: Callable[[Span], bool] | None,
+) -> list[tuple[QueryResult, Span]]:
+    """Ranged spans of ``grade`` (optionally filtered), paired with their result."""
+    return [
+        (r, span)
+        for r in results
+        for span in _spans(r.query, grade)
+        if _has_range(span) and (span_filter is None or span_filter(span))
+    ]
 
 
-def recall_at_k(
+def coverage_at_k(
+    results: list[QueryResult],
+    k: int,
+    weights: LineWeights,
+    grade: int = DECISIVE,
+    span_filter: Callable[[Span], bool] | None = None,
+) -> float:
+    """Did the answer arrive? Fraction of gold-span tokens present in the top-k.
+
+    For each span: the tokens of its lines covered by the union of same-file
+    top-k items, summed over all spans and divided by the total tokens across
+    all spans (so longer answers weigh more). An answer that arrives split
+    across two chunks still counts in full — the answer did arrive — which
+    keeps the metric fair to chunkers that fragment. This replaces
+    binary-overlap recall, which counted a span as fully retrieved when a
+    chunk overlapped even one of its lines.
+    """
+    covered_total = 0
+    span_total = 0
+    for r, span in _graded_spans(results, grade, span_filter):
+        assert span.start_line is not None and span.end_line is not None
+        covered: set[int] = set()
+        for item in r.retrieved[:k]:
+            rng = _item_range(item)
+            if rng is None or not _same_file(item, span):
+                continue
+            lo = max(rng[0], span.start_line)
+            hi = min(rng[1], span.end_line)
+            covered.update(range(lo, hi + 1))
+        per_line = weights[Path(span.file).name]
+        span_total += sum(per_line[span.start_line - 1 : span.end_line])
+        covered_total += sum(per_line[line - 1] for line in covered)
+    return covered_total / span_total if span_total else 0.0
+
+
+def concentration_at_k(
+    results: list[QueryResult],
+    k: int,
+    weights: LineWeights,
+) -> float:
+    """What fraction of all retrieved tokens was answer? Mean over queries.
+
+    Per query: tokens of retrieved lines that fall inside any of that query's
+    gold spans (decisive or supportive — supportive context is labelled
+    useful, so it is not noise) divided by all tokens retrieved, averaged over
+    queries. Lines retrieved twice by overlapping items count twice, because
+    the agent reads them twice. This is the metric that penalises retrieving
+    far more text than the answer needs: a whole-file chunk scores
+    near-perfect coverage and near-zero concentration.
+    """
+    fractions: list[float] = []
+    for r in results:
+        spans = [s for s in (r.query.decisive_spans + r.query.supportive_spans) if _has_range(s)]
+        useful = 0
+        total = 0
+        for item in r.retrieved[:k]:
+            rng = _item_range(item)
+            if rng is None:
+                continue
+            file_name = item.get("source_path") or item.get("file_name") or ""
+            key = Path(file_name).name
+            if key not in weights:
+                continue
+            total += _line_tokens(weights, key, rng[0], rng[1])
+            useful_lines: set[int] = set()
+            for span in spans:
+                assert span.start_line is not None and span.end_line is not None
+                if not _same_file(item, span):
+                    continue
+                lo = max(rng[0], span.start_line)
+                hi = min(rng[1], span.end_line)
+                useful_lines.update(range(lo, hi + 1))
+            useful += sum(weights[key][line - 1] for line in useful_lines)
+        if total:
+            fractions.append(useful / total)
+    return sum(fractions) / len(fractions) if fractions else 0.0
+
+
+def wholeness_at_k(
     results: list[QueryResult],
     k: int,
     grade: int = DECISIVE,
     span_filter: Callable[[Span], bool] | None = None,
 ) -> float:
-    """Fraction of gold spans of ``grade`` found within the top-k items (micro).
+    """Did each answer arrive in one piece? Contained / overlapped.
 
-    Pass ``span_filter`` to restrict the denominator to a subset of spans (e.g.
-    only spans in ``.lean`` files), enabling per-content-type recall.
+    Among gold spans that any top-k item overlaps, the fraction fully
+    contained within a *single* item. This catches a failure the other two
+    metrics miss in combination: a chunk covering half an answer looks fine to
+    both, but an agent reading half a function has no signal that the other
+    half is missing. Conditional on overlap, so retrieving nothing scores 0
+    (empty denominator), not a spurious 1. Uses line ranges only — containment
+    needs no token weights. Read alongside coverage: wholeness alone says
+    nothing about what was missed entirely.
     """
-    total = 0
-    found = 0
-    for r in results:
-        topk = r.retrieved[:k]
-        for span in _spans(r.query, grade):
-            if span_filter is not None and not span_filter(span):
+    overlapped = 0
+    contained = 0
+    for r, span in _graded_spans(results, grade, span_filter):
+        assert span.start_line is not None and span.end_line is not None
+        hit = False
+        whole = False
+        for item in r.retrieved[:k]:
+            rng = _item_range(item)
+            if rng is None or not _same_file(item, span):
                 continue
-            total += 1
-            if any(item_hits_span(it, span) for it in topk):
-                found += 1
-    return found / total if total else 0.0
+            if rng[0] <= span.end_line and span.start_line <= rng[1]:
+                hit = True
+                if rng[0] <= span.start_line and span.end_line <= rng[1]:
+                    whole = True
+        if hit:
+            overlapped += 1
+            contained += int(whole)
+    return contained / overlapped if overlapped else 0.0
+
+
+def count_overlapped_spans(
+    results: list[QueryResult],
+    k: int,
+    grade: int = DECISIVE,
+    span_filter: Callable[[Span], bool] | None = None,
+) -> int:
+    """Count gold spans overlapped by any top-k item — wholeness's denominator."""
+    overlapped = 0
+    for r, span in _graded_spans(results, grade, span_filter):
+        assert span.start_line is not None and span.end_line is not None
+        for item in r.retrieved[:k]:
+            rng = _item_range(item)
+            if rng is None or not _same_file(item, span):
+                continue
+            if rng[0] <= span.end_line and span.start_line <= rng[1]:
+                overlapped += 1
+                break
+    return overlapped
 
 
 def count_spans(
@@ -133,109 +248,5 @@ def count_spans(
     grade: int = DECISIVE,
     span_filter: Callable[[Span], bool] | None = None,
 ) -> int:
-    """Count gold spans of ``grade`` (optionally filtered) — the recall denominator."""
-    return sum(
-        1
-        for r in results
-        for span in _spans(r.query, grade)
-        if span_filter is None or span_filter(span)
-    )
-
-
-def _has_range(span: Span) -> bool:
-    return span.start_line is not None and span.end_line is not None
-
-
-def mean_iou_at_k(
-    results: list[QueryResult],
-    k: int,
-    grade: int = DECISIVE,
-    span_filter: Callable[[Span], bool] | None = None,
-) -> float:
-    """Mean best line-range IoU over gold spans of ``grade`` within the top-k items.
-
-    For each span (that has a line range), takes the largest ``line_iou`` among the
-    top-k retrieved items, then averages. Measures *localization precision* — how
-    tightly retrieval bounds the gold region — complementing recall's coverage.
-    Spans without a line range are excluded (IoU is undefined for them), so this
-    denominator can be smaller than recall's; report it separately.
-    """
-    scores: list[float] = []
-    for r in results:
-        topk = r.retrieved[:k]
-        for span in _spans(r.query, grade):
-            if not _has_range(span):
-                continue
-            if span_filter is not None and not span_filter(span):
-                continue
-            scores.append(max((line_iou(it, span) for it in topk), default=0.0))
-    return sum(scores) / len(scores) if scores else 0.0
-
-
-def count_ranged_spans(
-    results: list[QueryResult],
-    grade: int = DECISIVE,
-    span_filter: Callable[[Span], bool] | None = None,
-) -> int:
-    """Count gold spans of ``grade`` that have a line range — the IoU denominator."""
-    return sum(
-        1
-        for r in results
-        for span in _spans(r.query, grade)
-        if _has_range(span) and (span_filter is None or span_filter(span))
-    )
-
-
-def _dcg(relevances: list[int]) -> float:
-    return float(sum((2**rel - 1) / math.log2(i + 2) for i, rel in enumerate(relevances)))
-
-
-def ndcg_at_k(results: list[QueryResult], k: int) -> float:
-    """NDCG@k over graded span *coverage* (decisive=2, supportive=1), averaged over queries.
-
-    Each gold span is credited at most once — at the rank of the first retrieved
-    item that covers it. Without this, overlapping chunks that all hit one span
-    (e.g. naive line windows) accumulate gains beyond the ideal and push NDCG
-    above 1. Crediting per span keeps the achieved gains a subset of the ideal
-    multiset, so NDCG stays in [0, 1] and rewards rank/coverage, not redundancy.
-    """
-    scores = []
-    for r in results:
-        decisive, supportive = r.query.decisive_spans, r.query.supportive_spans
-        seen_dec: set[int] = set()
-        seen_sup: set[int] = set()
-        gains: list[int] = []
-        for item in r.retrieved[:k]:
-            grade = 0
-            for i, span in enumerate(decisive):
-                if i not in seen_dec and item_hits_span(item, span):
-                    seen_dec.add(i)
-                    grade = DECISIVE
-                    break
-            else:
-                for i, span in enumerate(supportive):
-                    if i not in seen_sup and item_hits_span(item, span):
-                        seen_sup.add(i)
-                        grade = SUPPORTIVE
-                        break
-            gains.append(grade)
-        ideal = sorted([DECISIVE] * len(decisive) + [SUPPORTIVE] * len(supportive), reverse=True)
-        idcg = _dcg(ideal[:k])
-        if idcg == 0:
-            continue
-        scores.append(_dcg(gains) / idcg)
-    return sum(scores) / len(scores) if scores else 0.0
-
-
-def mrr_at_k(results: list[QueryResult], k: int) -> float:
-    """Mean reciprocal rank of the first decisive-span hit within the top-k."""
-    considered = [r for r in results if r.query.decisive_spans]
-    if not considered:
-        return 0.0
-    total = 0.0
-    for r in considered:
-        for rank, item in enumerate(r.retrieved[:k], start=1):
-            if any(item_hits_span(item, s) for s in r.query.decisive_spans):
-                total += 1.0 / rank
-                break
-    return total / len(considered)
+    """Count ranged gold spans of ``grade`` (optionally filtered) — coverage's denominator."""
+    return len(_graded_spans(results, grade, span_filter))
