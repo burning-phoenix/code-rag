@@ -36,3 +36,10 @@ eval_pointer_index.json
 .idea/
 .vscode/
 *.swp
+# personal research corpus (frontend add-on)
+/RAG_data/
+/RAG_data_pdf/
+/rag-config.json
+/docker-compose.yml
+/frontend/
+frontend/

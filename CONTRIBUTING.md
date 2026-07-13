@@ -130,20 +130,32 @@ data and is excluded from ruff via `extend-exclude` in `pyproject.toml`.
 ## Evaluation
 
 `src/code_rag/eval/` is a retrieval-quality harness with span-level graded relevance
-(decisive / supportive) and metrics: recall@k, NDCG@k (span-coverage, capped ≤1),
-MRR@k, hit-rate, and **line-range IoU@k** (localization precision). It is diagnostic,
-never a CI gate.
+(decisive / supportive) and three metrics, one per consumer failure mode, swept
+over k: **coverage@k** (token-weighted union coverage — did the answer arrive?),
+**concentration@k** (useful tokens / retrieved tokens — how much of what the
+agent read was answer?), and **wholeness@k** (covered answers fully contained in
+a single item — did each arrive in one piece?). Hits are **line geometry only**;
+symbol names are never consulted (only AST chunkers emit them, so scoring
+through symbols is unfair to other strategies). Rank metrics (NDCG, MRR) were
+deliberately removed: the consuming agent reads the top-k as a set, and budget
+sensitivity is already the k-sweep. It is diagnostic, never a CI gate.
 
 ```bash
 code-rag eval --project-dir tests/eval --dataset tests/eval/golden_dataset.json --matrix
 ```
 
-`--matrix` runs the standard ablation (AST+enrich / AST / line-based) and emits a
-full Markdown report (metric definitions, sample sizes, per-content-type tables) to
-`REPORT.md` at the repo root by default (override with `--report-md PATH`). See
+`--matrix` runs the standard ablation (AST+enrich / AST / line-based / whole-file
+canary) and emits a full Markdown report (metric definitions, sample sizes,
+per-content-type tables) to `REPORT.md` at the repo root by default (override
+with `--report-md PATH`). The **whole-file canary** is the suite's own
+regression test — a degenerate chunker embodying the coverage cheat; the report
+appends a loud warning if the metrics ever crown it. See
 [`REPORT.md`](REPORT.md) for the latest results. The golden dataset
 (`tests/eval/golden_dataset.json`) is hand-written — do **not** auto-generate
-queries with an LLM, as that biases the enrichment ablation.
+queries with an LLM, as that biases the enrichment ablation — and follows the
+labeling rules in `eval/dataset.py`: decisive spans are **answer-sized** (the
+minimal region stating the answer, never a parser's unit), every decisive span
+carries a line range, and every independently-sufficient location is decisive.
 
 ## Roadmap — higher quality & more extensibility
 
@@ -194,10 +206,23 @@ CI is hermetic (fakes only), so the real I/O boundaries are unit-untested:
   deltas come with error bars instead of reading as fact.
 - **Bigger golden set per content type** (~50 each) for statistical power on the
   per-type claims (see the sample-size note in `REPORT.md`).
-- **Content-type-aware enrichment.** The eval shows enrichment clearly helps code
-  (≈ +22% recall@10 on `.py`) but is neutral-to-negative on prose. Make
-  `enrich_chunks` skip markdown (or take a per-extension policy from config) — an
-  evidence-backed default that also saves LLM cost.
+- **Content-type-aware enrichment, model-aware too.** The three-model
+  enrichment ablation (`--enrichment-models`) shows the *writer* matters where
+  retrieval is winnable: on Python, gemma-4-31b's summaries reach +24% relative
+  coverage at k=3 (0.617 → 0.763), clearly ahead of llama-4-scout and
+  deepseek-v4-flash (~0.69 each) — and on Lean no model turns enrichment
+  positive (scout −0.063 vs plain AST; gemma shrinks it to −0.024, inside
+  noise). Make `enrich_chunks` a per-extension policy with a recommended model
+  (enrich code with a mid-size model that writes *discriminative* questions;
+  skip formal math) — evidence-backed defaults that also save LLM cost.
+- **A hybrid route for `.lean`.** Line windows out-cover every AST variant on
+  Lean (0.720 vs 0.597–0.660 coverage@10) even though chunk reachability is 1.0
+  for both — the gap is embedding-side: math-English queries barely rank Lean
+  notation (and the English papers in the corpus outrank it as distractors), so
+  coarse sweep beats precise chunks wherever ranking degrades. Three enrichment
+  models later, English summaries still don't fix it. A lexical or hybrid
+  retrieval path for `.lean`, or notation-aware enrichment, is the experiment
+  these numbers ask for.
 - **Token-aware `lookup_index`.** `search_index` does full-string substring
   matching, so natural-language queries pinned to `lookup_index` under-retrieve.
   Splitting the query into terms and ranking concepts by term overlap would let it

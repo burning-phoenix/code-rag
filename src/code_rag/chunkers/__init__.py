@@ -1,8 +1,9 @@
 """
-Chunker registry: maps file extensions to chunkers (Open/Closed).
+Chunker registry: maps file extensions to chunkers.
 
 Adding support for a new file type means writing one ``BaseChunker`` subclass
 and registering it in :func:`get_registry` — no existing dispatch code changes.
+When two chunkers claim the same extension, the later registration wins.
 """
 
 import logging
@@ -74,8 +75,9 @@ def chunk_directory(
             logger.error("Failed to chunk %s: %s", file_path, e)
             continue
         # Stamp the corpus-relative path so chunk identity is collision-free
-        # across same-named files in different directories. Chunkers stay
-        # ignorant of layout; the orchestrator owns where files live.
+        # across same-named files in different directories. Chunkers never see
+        # directory layout; this function is the one place that knows where
+        # files live.
         rel_path = file_path.relative_to(directory).as_posix()
         for chunk in file_chunks:
             chunk.source_path = rel_path

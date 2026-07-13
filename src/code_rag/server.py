@@ -3,12 +3,13 @@ MCP Server: exposes document and code RAG tools to Claude Code.
 
 Tools:
   - search_documents: semantic vector search across all content types
-  - search_code: code-specific search with parent-child context retrieval
-  - lookup_index: static pointer index lookup (zero-hallucination fallback)
+  - search_code: code-specific search with parent-class context
+  - lookup_index: exact concept lookup against the prebuilt pointer index
+    (no embeddings involved, so every result is a real file location)
 
 The server is built by :func:`create_server`, which binds the tool handlers to
-injected providers. ``main`` is the composition root that wires the real
-OpenRouter + Qdrant providers and starts the STDIO transport.
+the providers passed in. ``main`` constructs the real OpenRouter and Qdrant
+providers and starts the STDIO transport.
 """
 
 import logging
@@ -160,10 +161,12 @@ def create_server(
     @mcp.tool()
     async def lookup_index(concept: str) -> str:
         """
-        Look up a concept in the static pointer index for exact file locations.
+        Look up a concept in the prebuilt index for exact file locations.
 
-        This is a zero-hallucination fallback that maps concepts directly to
-        file paths and line numbers. No embedding or vector search is involved.
+        Exact lookup, not semantic search: the concept is matched against an
+        index built at ingest time, and every result is a real file path and
+        line range taken from that index. No embeddings or vector search are
+        involved. Use this when you know the name of the thing you want.
 
         Useful for finding specific definitions, theorems, function names,
         class names, or domain-specific terms.

@@ -1,7 +1,9 @@
 """
-Static pointer index: a concept → file/line-range mapping for zero-hallucination
-lookups. Each file type knows how to scan itself (``BaseChunker.scan``); this
-module only orchestrates the scan, persistence, and lookup.
+Pointer index: a concept → file/line-range mapping built at ingest time and
+used for exact lookups (results come straight from the index, so they are
+always real file locations). Each file type knows how to scan itself
+(``BaseChunker.scan``); this module only runs the scan and handles
+persistence and lookup.
 """
 
 import json
