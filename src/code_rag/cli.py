@@ -253,9 +253,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
     if args.matrix:
         runs = [
-            RunConfig(
-                label=f"ast{enrich_tag(m)}", enrich=True, chunker="ast", enrichment_model=m
-            )
+            RunConfig(label=f"ast{enrich_tag(m)}", enrich=True, chunker="ast", enrichment_model=m)
             for m in enrich_models
         ] + [
             RunConfig(label="ast", enrich=False, chunker="ast"),

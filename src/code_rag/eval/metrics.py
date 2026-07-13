@@ -160,9 +160,7 @@ def concentration_at_k(
     """
     fractions: list[float] = []
     for r in results:
-        spans = [
-            s for s in (r.query.decisive_spans + r.query.supportive_spans) if _has_range(s)
-        ]
+        spans = [s for s in (r.query.decisive_spans + r.query.supportive_spans) if _has_range(s)]
         useful = 0
         total = 0
         for item in r.retrieved[:k]:
