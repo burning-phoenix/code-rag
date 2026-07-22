@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "code-rag"
 version = "0.2.0"
 description = "MCP server for code and document RAG with AST-aware chunking and Qdrant"
+license = {text = "Apache-2.0"}
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]",
